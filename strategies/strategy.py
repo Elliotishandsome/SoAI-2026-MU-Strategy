@@ -26,6 +26,7 @@ SoAI 2026 AI Algorithmic Trading Competition — MU 日內 AI 策略
 """
 
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 import pandas as pd
 import numpy as np
 
@@ -37,6 +38,8 @@ from strategies.params import (
     VOLATILITY_INDEX,
     BENCHMARK,
     INITIAL_CAPITAL,
+    SLEEPTIME,
+    RESAMPLE_MINUTES,
     BUY_COMMISSION_BPS,
     SELL_COMMISSION_BPS,
     MAX_RISK_RATIO,
@@ -98,11 +101,13 @@ class Strategy(_LumibotStrategy):
           "5M"  = 5 分鐘回測（Pandas CSV）
           "1M"  = 1 分鐘回測（Pandas CSV）
         """
-        # --- 交易頻率（預設日線，適配 Yahoo backtest） ---
-        self.sleeptime = "1D"
+        # --- 交易頻率（由 params.SLEEPTIME 控制） ---
+        self.sleeptime = SLEEPTIME
 
         # --- 判斷模式：日線 vs 分鐘級 ---
         self.intraday_mode = self.sleeptime in ("1M", "5M", "15M", "60M")
+        # 美東時區（交易時段判斷用）
+        self._ny_tz = ZoneInfo("America/New_York")
 
         # --- 風控管理器 ---
         self.risk_mgr = RiskManager(
@@ -164,24 +169,21 @@ class Strategy(_LumibotStrategy):
             return
 
         # --- Step 2: 取歷史數據並計算指標 ---
-        lookback = max(
-            RSI_PERIOD + 1,
-            ATR_PERIOD + 1,
-            BB_PERIOD + 1,
-            VOLUME_MA_PERIOD + 1,
-            RS_EMA_PERIOD + 1,
-            EMA_SLOW + 1,
-            30,  # 安全邊際
-        )
+        lookback = self._get_lookback()
 
-        mu_bars = self.get_historical_prices(TRADE_SYMBOL, length=lookback, timestep="day")
-        smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="day")
+        if self.intraday_mode:
+            # 分鐘模式：請求 1 分鐘 bar，然後重取樣為 RESAMPLE_MINUTES 分鐘 K 線
+            mu_bars = self.get_historical_prices(TRADE_SYMBOL, length=lookback, timestep="minute")
+            smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="minute")
+        else:
+            mu_bars = self.get_historical_prices(TRADE_SYMBOL, length=lookback, timestep="day")
+            smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="day")
 
         if mu_bars is None or smh_bars is None:
             return
 
-        mu_df = mu_bars.df
-        smh_df = smh_bars.df
+        mu_df = self._prepare_bars_df(mu_bars.df)
+        smh_df = self._prepare_bars_df(smh_bars.df)
 
         if mu_df.empty or smh_df.empty:
             return
@@ -194,7 +196,7 @@ class Strategy(_LumibotStrategy):
 
         # --- Step 3: 檢查現有持倉的出場訊號 ---
         positions = self.get_positions()
-        mu_position = next((p for p in positions if p.asset == TRADE_SYMBOL), None)
+        mu_position = next((p for p in positions if p.symbol == TRADE_SYMBOL), None)
 
         if mu_position is not None and float(mu_position.quantity) > 0:
             exit_signals = check_exit_signals(
@@ -223,10 +225,10 @@ class Strategy(_LumibotStrategy):
                     self.risk_mgr.increment_trade_count()
                     self._has_position = False
 
-            # 檢查強制清倉時間（僅分鐘模式）
+            # 檢查強制清倉時間（僅分鐘模式，美東時區）
             if self.intraday_mode:
-                current_time = now.time() if hasattr(now, 'time') else now
-                if self.risk_mgr.is_force_close_time(current_time if isinstance(current_time, time) else now.time()):
+                now_ny = now.astimezone(self._ny_tz)
+                if self.risk_mgr.is_force_close_time(now_ny.time()):
                     self._sell_all(now, "15:55 強制清倉")
                     self.risk_mgr.increment_trade_count()
                     self._has_position = False
@@ -250,10 +252,10 @@ class Strategy(_LumibotStrategy):
         if not can_trade:
             return
 
-        # 時間窗口檢查（僅分鐘模式）
+        # 時間窗口檢查（僅分鐘模式，美東時區：開盤 30 分鐘僅監控）
         if self.intraday_mode:
-            current_time = now.time() if hasattr(now, 'time') else now
-            if self.risk_mgr.is_no_trade_window(current_time if isinstance(current_time, time) else now.time()):
+            now_ny = now.astimezone(self._ny_tz)
+            if self.risk_mgr.is_no_trade_window(now_ny.time()):
                 return
 
         # 三層決策
@@ -290,6 +292,69 @@ class Strategy(_LumibotStrategy):
             f"daily_trades={self.risk_mgr.daily_trade_count} | "
             f"daily_pnl=${daily_pnl:,.2f}"
         )
+
+    # ------------------------------------------------------------------
+    # 輔助：lookback 計算 & 數據整理
+    # ------------------------------------------------------------------
+    def _get_lookback(self) -> int:
+        """
+        計算歷史數據請求長度（bar 數）。
+
+        日線模式：只需覆蓋最長指標週期。
+        分鐘模式：指標在重取樣後的 K 線上計算，因此需保證
+        重取樣後的 bar 數 ≥ 最長指標週期，並預留安全邊際。
+        """
+        if not self.intraday_mode:
+            return max(
+                RSI_PERIOD + 1,
+                ATR_PERIOD + 1,
+                BB_PERIOD + 1,
+                VOLUME_MA_PERIOD + 1,
+                RS_EMA_PERIOD + 1,
+                EMA_SLOW + 1,
+                30,  # 安全邊際
+            )
+
+        # 重取樣後需要的 K 線數（最長指標週期 × RESAMPLE_MINUTES + 安全邊際）
+        need_resampled_bars = (EMA_SLOW + BB_PERIOD) * RESAMPLE_MINUTES + 100
+        return need_resampled_bars * RESAMPLE_MINUTES
+
+    def _prepare_bars_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        整理 Lumibot 返回的歷史 bar DataFrame。
+
+        - 處理 MultiIndex 欄位
+        - 確保 DatetimeIndex 且排序去重
+        - 分鐘模式：重取樣為 RESAMPLE_MINUTES 分鐘 K 線
+        """
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.copy()
+        # 處理 MultiIndex 欄位（例如 ('close', 'MU')）
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+
+        # 只保留 OHLCV
+        cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+        if len(cols) < 5:
+            return pd.DataFrame()
+        df = df[cols].astype(float)
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+
+        # 分鐘模式：重取樣為 K 線
+        if self.intraday_mode and RESAMPLE_MINUTES > 1:
+            df = (
+                df.resample(f"{RESAMPLE_MINUTES}min", label="right", closed="right")
+                .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+                .dropna(subset=["open", "close"])
+            )
+
+        return df
 
     # ------------------------------------------------------------------
     # 三層決策整合
@@ -397,7 +462,7 @@ class Strategy(_LumibotStrategy):
         """賣出全部 MU 持倉。"""
         positions = self.get_positions()
         for p in positions:
-            if p.asset == TRADE_SYMBOL and float(p.quantity) > 0:
+            if p.symbol == TRADE_SYMBOL and float(p.quantity) > 0:
                 order = self.create_order(TRADE_SYMBOL, float(p.quantity), "sell")
                 self.submit_order(order)
                 self._has_position = False

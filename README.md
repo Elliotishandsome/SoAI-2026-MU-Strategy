@@ -55,12 +55,15 @@ strategies/
 ## 快速回測
 
 ```bash
+# 分鐘級回測（Pandas CSV 模式，建議先下載數據）
+python download_minute_data.py    # yfinance 抓最近 7 天 1 分鐘 OHLCV
+python backtest.py                # 5 分鐘 K 線回測
+
 # 日線回測（Yahoo Finance，免 API Key）
 python backtest_yahoo.py
-
-# 分鐘級回測（需自備 CSV 數據）
-python backtest.py
 ```
+
+**模式切換**：在 `strategies/params.py` 修改 `SLEEPTIME`（`"5M"` / `"1M"` / `"1D"`）與 `RESAMPLE_MINUTES`（分鐘級 K 線重取樣週期）。分鐘級回測時交易時段（9:30–10:00 監控期、15:55 強制清倉）自動以美東時間生效。
 
 ---
 

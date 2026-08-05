@@ -31,8 +31,8 @@ from strategies.strategy import Strategy
 
 # 回測區間 — 使用 Yahoo Finance 有數據的範圍
 # 注意：未來日期 Yahoo 不會有數據；請設定為過往日期
-BACKTEST_START = datetime(2025, 1, 1)
-BACKTEST_END = datetime(2025, 8, 5)
+BACKTEST_START = datetime(2026, 7, 6)
+BACKTEST_END = datetime(2026, 8, 5)
 
 # 初始資金（與 params.py 中保持一致）
 BUDGET = 1_000_000

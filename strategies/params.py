@@ -26,6 +26,15 @@ VOLATILITY_INDEX = "^VIX"  # 恐慌指數（Yahoo 代碼為 ^VIX；VIX 選項也
 # 回測對標基準
 BENCHMARK = "SPY"
 
+# 策略喚醒頻率（Lumibot sleeptime）：
+#   "5M" = 5 分鐘級（分鐘回測，配合 data/ 下的 1m CSV 使用）
+#   "1M" = 1 分鐘級
+#   "1D" = 日線級（Yahoo backtest）
+SLEEPTIME = "5M"
+
+# 分鐘級回測時，將 1 分鐘 bar 重取樣為幾分鐘的 K 線（5 = 5 分鐘 K 線）
+RESAMPLE_MINUTES = 5
+
 # CSV 數據模式（Pandas backtest）使用的標的清單（保留相容性）
 STOCK_SLEEVE_SYMBOLS = [TRADE_SYMBOL, SECTOR_ETF, BENCHMARK]
 CRYPTO_SLEEVE_SYMBOLS: list[str] = []
