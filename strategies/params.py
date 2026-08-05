@@ -1,40 +1,92 @@
 """
-Parameters shared by the local backtest harness.
+策略參數配置 — MU 日內 AI 交易策略（SoAI 2026）
 
-The official competition execution environment is provided by the
-IntelligenceX technical team and may expose its own universe. This file
-controls the *local* backtest harness only (``backtest.py``), so you can
-iterate quickly during development.
+此檔案集中管理所有可調參數，方便回測調參與後續修改。
+分為以下區塊：
+  1. 交易標的 & 數據源
+  2. 資金 & 費率
+  3. 技術指標參數
+  4. 風控參數
+  5. 交易時段
 
-How to customise
-----------------
-1. List the equity / spot tickers you want to trade in
-   ``STOCK_SLEEVE_SYMBOLS``.
-2. List the crypto tickers (quoted in USD) in ``CRYPTO_SLEEVE_SYMBOLS``.
-3. Pick benchmarks for the Lumibot tearsheet comparison line via
-   ``STOCK_BENCH`` / ``CRYPTO_BENCH``.
-4. Make sure each symbol has a matching ``data/{SYMBOL}_1m_spot.csv``
-   file before running ``python backtest.py``.
-
-The template ships with a single placeholder symbol (``EXAMPLE``) so the
-harness runs end-to-end out of the box against the sample CSV in ``data/``.
+使用方式：在其他模組中 `from strategies.params import *` 或按區塊導入。
 """
 
-# Equity / spot tickers traded by the local backtest. Add your own symbols
-# here and drop the matching CSV files into ``data/``.
-STOCK_SLEEVE_SYMBOLS: list[str] = [
-    "EXAMPLE",
-]
+# ============================================================================
+# 1. 交易標的 & 數據源
+# ============================================================================
 
-# Crypto tickers (quoted in USD). Leave empty if your strategy is stocks-only.
+# 主交易標的
+TRADE_SYMBOL = "MU"
+
+# 輔助標的（用於情緒過濾）
+SECTOR_ETF = "SMH"       # 半導體板塊 ETF
+VOLATILITY_INDEX = "^VIX"  # 恐慌指數（Yahoo 代碼為 ^VIX；VIX 選項也可）
+
+# 回測對標基準
+BENCHMARK = "SPY"
+
+# CSV 數據模式（Pandas backtest）使用的標的清單（保留相容性）
+STOCK_SLEEVE_SYMBOLS = [TRADE_SYMBOL, SECTOR_ETF, BENCHMARK]
 CRYPTO_SLEEVE_SYMBOLS: list[str] = []
-
-# Benchmark symbols. Used by Lumibot to render the comparison line on the
-# generated tearsheet HTML.
-STOCK_BENCH: str = "EXAMPLE"
-CRYPTO_BENCH: str = "EXAMPLE"
-
-# Derived set used by ``backtest.py`` to decide whether a loaded symbol
-# should be modelled as ``Asset.AssetType.CRYPTO`` vs ``STOCK``. Do not
-# edit directly; change ``CRYPTO_SLEEVE_SYMBOLS`` instead.
+STOCK_BENCH = BENCHMARK
+CRYPTO_BENCH = BENCHMARK
 CRYPTO_SYMBOLS: set[str] = set(CRYPTO_SLEEVE_SYMBOLS)
+
+# ============================================================================
+# 2. 資金 & 費率
+# ============================================================================
+
+INITIAL_CAPITAL = 1_000_000       # 初始總資金 (USD)
+BUY_COMMISSION_BPS = 2.0          # 買入手續費 (bps, 0.02%)
+SELL_COMMISSION_BPS = 2.0         # 賣出手續費 (bps, 0.02%)
+SLIPPAGE_BPS = 1.0                # 滑點假設 (bps)
+
+# ============================================================================
+# 3. 技術指標參數
+# ============================================================================
+
+# RSI
+RSI_PERIOD = 14
+RSI_OVERSOLD_THRESHOLD = 40       # 買入觸發：RSI 突破此值
+RSI_OVERBOUGHT_THRESHOLD = 70     # 止盈觸發：RSI 超過此值
+
+# 移動平均 / EMA
+VWAP_LOOKBACK = 5                 # VWAP（日線模式即收盤價均線）回看週期
+EMA_FAST = 5                      # 快線
+EMA_SLOW = 20                     # 慢線（止盈參考）
+
+# RS_Ratio（相對強弱）
+RS_EMA_PERIOD = 10                # RS_Ratio EMA 週期
+
+# 布林帶
+BB_PERIOD = 20
+BB_STD_MULTIPLIER = 2.0
+
+# ATR
+ATR_PERIOD = 14
+
+# 成交量
+VOLUME_MA_PERIOD = 10             # 成交量均線週期
+VOLUME_SURGE_MULTIPLIER = 1.5     # 放量倍數門檻
+
+# ============================================================================
+# 4. 風控參數
+# ============================================================================
+
+MAX_RISK_RATIO = 0.02             # 單筆最大風險比例 (2%)
+ATR_STOP_MULTIPLIER = 1.5         # 止損 ATR 倍數
+MAX_POSITION_RATIO = 0.25         # 單筆頭寸上限 (25% of capital)
+MAX_POSITION_VALUE = 250_000      # 單筆建倉市值上限 (USD)
+DAILY_LOSS_LIMIT = 15_000         # 日內虧損熔斷 (USD)
+DAILY_LOSS_LIMIT_RATIO = 0.015    # 日內虧損熔斷比例 (1.5%)
+MAX_DAILY_TRADES = 20             # 單日交易次數上限
+TAKE_PROFIT_RATIO = 0.50          # 首段止盈平倉比例 (50%)
+
+# ============================================================================
+# 5. 交易時段（美東時間 EST）
+# ============================================================================
+
+MARKET_OPEN = "09:30"
+NO_TRADE_UNTIL = "10:00"          # 開盤前 30 分鐘僅監控不下單
+FORCE_CLOSE_TIME = "15:55"        # 收盤前 5 分鐘強制清倉

@@ -1,49 +1,89 @@
 """
-SoAI 2026 AI Algorithmic Trading Competition - participant entrypoint.
+SoAI 2026 AI Algorithmic Trading Competition — MU 日內 AI 策略
 
-The official execution environment imports the class defined here, so:
+三層決策架構：
+  1. 母系統 — 大盤與板塊情緒過濾（SMH VWAP + VIX 急升檢測）
+  2. 核心系統 — 個股相對強弱（RS Ratio = MU/SMH vs. EMA）
+  3. 子系統 — 微觀執行觸發（價格突破 VWAP + RSI + 放量）
 
-* Keep the class name ``Strategy``.
-* Keep this file at ``strategies/strategy.py``.
-* Keep the import path ``from strategies.strategy import Strategy``.
+風控約束：
+  - 固定風險 + ATR 自適應倉位模型
+  - 單筆頭寸上限 $250,000
+  - 日內虧損熔斷 $15,000
+  - 單日最多 20 筆交易
+  - 開盤 30 分鐘僅監控，收盤前 5 分鐘強制清倉（日線模式自動停用）
 
-Build your strategy by editing ``initialize`` and ``on_trading_iteration``
-below. The default bodies are intentionally minimal so a fresh clone runs
-end-to-end - replace them with your own logic.
+支援兩種執行模式：
+  - 日線模式（Yahoo backtest）: sleeptime = "1D"
+  - 分鐘模式（Pandas backtest）: sleeptime = "5M"
 
-Useful Lumibot documentation
-----------------------------
-* Lifecycle methods:    https://lumibot.lumiwealth.com/lifecycle_methods.html
-* Strategy methods:     https://lumibot.lumiwealth.com/strategy_methods.html
-* Strategy properties:  https://lumibot.lumiwealth.com/strategy_properties.html
-* Entities (Asset,
-  Order, Position):     https://lumibot.lumiwealth.com/entities.html
-* Backtesting overview: https://lumibot.lumiwealth.com/backtesting.html
+模組化結構:
+  strategies/params.py           — 所有可調參數
+  strategies/indicators.py       — 技術指標計算（純函數）
+  strategies/risk_manager.py     — 風控管理（倉位 + 熔斷 + 時間約束）
+  strategies/signal_generator.py — 三層訊號生成
+  strategies/strategy.py         — 本檔案：主策略類（Lumibot 入口）
 """
 
+from datetime import datetime, time
+import pandas as pd
+import numpy as np
+
 from lumibot.strategies import Strategy as _LumibotStrategy
+
+from strategies.params import (
+    TRADE_SYMBOL,
+    SECTOR_ETF,
+    VOLATILITY_INDEX,
+    BENCHMARK,
+    INITIAL_CAPITAL,
+    BUY_COMMISSION_BPS,
+    SELL_COMMISSION_BPS,
+    MAX_RISK_RATIO,
+    ATR_STOP_MULTIPLIER,
+    MAX_POSITION_VALUE,
+    DAILY_LOSS_LIMIT,
+    MAX_DAILY_TRADES,
+    TAKE_PROFIT_RATIO,
+    RSI_OVERBOUGHT_THRESHOLD,
+    RSI_OVERSOLD_THRESHOLD,
+    RSI_PERIOD,
+    ATR_PERIOD,
+    VWAP_LOOKBACK,
+    EMA_SLOW,
+    RS_EMA_PERIOD,
+    BB_PERIOD,
+    BB_STD_MULTIPLIER,
+    VOLUME_MA_PERIOD,
+    VOLUME_SURGE_MULTIPLIER,
+)
+from strategies.indicators import (
+    compute_rsi,
+    compute_atr,
+    compute_rolling_vwap,
+    compute_ema,
+    compute_bollinger_bands,
+    compute_rs_ratio,
+    compute_rs_ratio_ema,
+    compute_volume_ma,
+)
+from strategies.risk_manager import RiskManager
+from strategies.signal_generator import (
+    Signal,
+    HOLD,
+    check_market_sentiment,
+    check_relative_strength,
+    check_entry_signal,
+    check_exit_signals,
+)
 
 
 class Strategy(_LumibotStrategy):
     """
-    Your strategy implementation.
+    MU 日內 AI 交易策略 — 三層決策 + 自適應風控。
 
-    The two methods you almost always need are :meth:`initialize` and
-    :meth:`on_trading_iteration`. Lumibot supports many other lifecycle
-    hooks (``before_market_opens``, ``after_market_closes``,
-    ``on_filled_order``, ...) - see the lifecycle docs linked above when
-    you need them.
-
-    Common attributes you can read at any time (full list in the
-    properties docs):
-
-    * ``self.cash`` / ``self.get_cash()`` - available cash.
-    * ``self.portfolio_value`` / ``self.get_portfolio_value()`` -
-      total mark-to-market portfolio value.
-    * ``self.first_iteration`` - ``True`` on the very first call to
-      ``on_trading_iteration``, useful for one-shot setup or buy & hold.
-    * ``self.is_backtesting`` - ``True`` when running under a backtest
-      engine, ``False`` when running live.
+    支援日線（Yahoo）和分鐘級（Pandas）兩種回測模式。
+    透過 self.intraday_mode 自動適配指標計算邏輯。
     """
 
     # ------------------------------------------------------------------
@@ -51,93 +91,323 @@ class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
     def initialize(self):
         """
-        Called once before trading begins.
+        策略初始化 — 設定頻率、標的、風控參數。
 
-        Typical responsibilities:
-
-        1. Choose how often the strategy wakes up via ``self.sleeptime``
-           (``"1D"`` once per trading day, ``"60M"`` hourly,
-           ``"5M"`` every five minutes, ``"1M"`` every minute).
-        2. Declare the universe you want to trade.
-        3. Set risk limits (max position weight, cash buffer, leverage cap).
-        4. Load any models or precomputed parameters and stash them on
-           ``self`` so :meth:`on_trading_iteration` can reuse them.
+        可透過調整 sleeptime 切換模式：
+          "1D"  = 日線回測（Yahoo）
+          "5M"  = 5 分鐘回測（Pandas CSV）
+          "1M"  = 1 分鐘回測（Pandas CSV）
         """
-        # How often this strategy is woken up. Examples:
-        #   "1D"  -> once per trading day (good default for DL signals)
-        #   "60M" -> every hour
-        #   "5M"  -> every five minutes (intraday)
+        # --- 交易頻率（預設日線，適配 Yahoo backtest） ---
         self.sleeptime = "1D"
 
-        # TODO: declare your universe, risk limits and any state/models
-        # you want to reuse later. For example:
-        #
-        #     self.target_assets = ["SPY", "QQQ"]
-        #     self.max_weight_per_asset = 0.6     # cap any single name at 60%
-        #     self.min_cash_buffer = 0.05         # keep >=5% in cash
-        #     self.lookback_days = 20             # for a moving-average signal
-        #     self.model = joblib.load("models/my_model.pkl")
+        # --- 判斷模式：日線 vs 分鐘級 ---
+        self.intraday_mode = self.sleeptime in ("1M", "5M", "15M", "60M")
 
-        self.log_message("Strategy initialized")
+        # --- 風控管理器 ---
+        self.risk_mgr = RiskManager(
+            initial_capital=INITIAL_CAPITAL,
+            max_risk_ratio=MAX_RISK_RATIO,
+            atr_multiplier=ATR_STOP_MULTIPLIER,
+            max_position_value=MAX_POSITION_VALUE,
+            daily_loss_limit=DAILY_LOSS_LIMIT,
+            max_daily_trades=MAX_DAILY_TRADES,
+            take_profit_ratio=TAKE_PROFIT_RATIO,
+        )
+
+        # --- 策略狀態 ---
+        self._has_position = False
+        self._entry_price = 0.0
+        self._daily_pnl = 0.0
+        self._indicators_cache: dict | None = None
+        self._last_indicator_idx: int = -1
+
+        # --- 標記是否已做首次計算 ---
+        self._indicators_ready = False
+
+        # --- 記錄每日起始組合淨值（用於計算當日盈虧） ---
+        self._day_start_value = self.get_portfolio_value()
+
+        self.log_message(
+            f"[MU Strategy] 初始化完成 | 模式={'intraday' if self.intraday_mode else 'daily'} | "
+            f"sleeptime={self.sleeptime} | 初始資金=${INITIAL_CAPITAL:,.0f}"
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle: per-step decision making
     # ------------------------------------------------------------------
     def on_trading_iteration(self):
         """
-        Called every ``self.sleeptime`` step while the market is open.
+        每次 sleeptime 觸發時執行。
 
-        The classic pattern is:
-
-        1. Read current portfolio state (cash, positions, P&L).
-        2. Pull market data (latest price + historical bars).
-        3. Compute your signal / model prediction and translate it into
-           target positions or weights.
-        4. Diff target vs current positions and submit orders.
-        5. Log enough information to debug later and write your report.
-
-        Replace the no-op below with your trading logic. The default log
-        line is a safe-to-keep instrumentation example - keep some form
-        of logging even after you add real logic, because the official
-        execution environment surfaces these messages back to you.
+        流程：
+          1. 獲取市場數據（MU, SMH, VIX）
+          2. 計算技術指標
+          3. 檢查持倉 → 出場邏輯
+          4. 檢查風控 → 入場邏輯
+          5. 執行訂單
         """
-        # ------------------------------------------------------------------
-        # Step 1: observe current state.
-        # ------------------------------------------------------------------
-        # portfolio_value = self.get_portfolio_value()
-        # cash = self.get_cash()
-        # positions = self.get_positions()
+        now = self.get_datetime()
+        portfolio_value = self.get_portfolio_value()
 
-        # ------------------------------------------------------------------
-        # Step 2: get market data.
-        # ------------------------------------------------------------------
-        # Latest tradable price:
-        #     price = self.get_last_price("SPY")
-        # Historical bars (returns a Bars entity; access .df for a DataFrame):
-        #     bars = self.get_historical_prices("SPY", length=20, timestep="day")
-        #     close = bars.df["close"]
+        # --- 每日重置檢查 ---
+        self.risk_mgr.check_new_day(now)
+        if self.risk_mgr.is_halted():
+            return  # 熔斷中，不做任何操作
 
-        # ------------------------------------------------------------------
-        # Step 3: compute your signal / model prediction.
-        # ------------------------------------------------------------------
-        # Translate it into a target weight in [-1, 1] (or [0, 1] long-only)
-        # and from there into a target quantity.
+        # --- Step 1: 獲取市場數據 ---
+        mu_price = self.get_last_price(TRADE_SYMBOL)
+        smh_price = self.get_last_price(SECTOR_ETF)
 
-        # ------------------------------------------------------------------
-        # Step 4: diff target vs current and submit orders.
-        # ------------------------------------------------------------------
-        # order = self.create_order("SPY", quantity, "buy")
-        # self.submit_order(order)
-        # # Or batch:
-        # self.submit_orders([order_a, order_b])
+        if mu_price is None or smh_price is None:
+            self.log_message(f"[{now}] 價格數據缺失，跳過本週期")
+            return
 
-        # TODO: implement your trading logic above.
-
-        # ------------------------------------------------------------------
-        # Step 5: log what happened so debugging stays painless.
-        # ------------------------------------------------------------------
-        self.log_message(
-            f"[Strategy] portfolio=${self.get_portfolio_value():,.2f}, "
-            f"cash=${self.get_cash():,.2f}, "
-            f"positions={self.get_positions()}"
+        # --- Step 2: 取歷史數據並計算指標 ---
+        lookback = max(
+            RSI_PERIOD + 1,
+            ATR_PERIOD + 1,
+            BB_PERIOD + 1,
+            VOLUME_MA_PERIOD + 1,
+            RS_EMA_PERIOD + 1,
+            EMA_SLOW + 1,
+            30,  # 安全邊際
         )
+
+        mu_bars = self.get_historical_prices(TRADE_SYMBOL, length=lookback, timestep="day")
+        smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="day")
+
+        if mu_bars is None or smh_bars is None:
+            return
+
+        mu_df = mu_bars.df
+        smh_df = smh_bars.df
+
+        if mu_df.empty or smh_df.empty:
+            return
+
+        # 計算指標
+        indicators = self._compute_indicators(mu_df, smh_df)
+        self._indicators_cache = indicators
+        self._indicators_ready = True
+        idx = -1  # 最新一根 bar
+
+        # --- Step 3: 檢查現有持倉的出場訊號 ---
+        positions = self.get_positions()
+        mu_position = next((p for p in positions if p.asset == TRADE_SYMBOL), None)
+
+        if mu_position is not None and float(mu_position.quantity) > 0:
+            exit_signals = check_exit_signals(
+                price=indicators["mu_close"].iloc[idx],
+                bb_upper=indicators["mu_bb_upper"].iloc[idx],
+                rsi=indicators["mu_rsi"].iloc[idx],
+                ema_slow=indicators["mu_ema_slow"].iloc[idx],
+            )
+            for sig in exit_signals:
+                if sig.action == "SELL_STOP":
+                    self._sell_all(now, sig.reason)
+                    self.risk_mgr.increment_trade_count()
+                    self._has_position = False
+                    break
+                elif sig.action == "SELL_TAKE_PROFIT":
+                    qty = self.risk_mgr.compute_take_profit_quantity(int(float(mu_position.quantity)))
+                    self._sell_partial(qty, now, sig.reason)
+                    self.risk_mgr.increment_trade_count()
+
+            # 檢查止損（ATR 追蹤止損）
+            if self._has_position and self._entry_price > 0:
+                atr = indicators["mu_atr"].iloc[idx]
+                stop_price = self._entry_price - ATR_STOP_MULTIPLIER * atr
+                if mu_price <= stop_price:
+                    self._sell_all(now, f"ATR 追蹤止損: 價格 {mu_price:.2f} ≤ 止損價 {stop_price:.2f}")
+                    self.risk_mgr.increment_trade_count()
+                    self._has_position = False
+
+            # 檢查強制清倉時間（僅分鐘模式）
+            if self.intraday_mode:
+                current_time = now.time() if hasattr(now, 'time') else now
+                if self.risk_mgr.is_force_close_time(current_time if isinstance(current_time, time) else now.time()):
+                    self._sell_all(now, "15:55 強制清倉")
+                    self.risk_mgr.increment_trade_count()
+                    self._has_position = False
+
+            # 檢查日內熔斷
+            daily_pnl = portfolio_value - self._day_start_value
+            if self.risk_mgr.should_halt(daily_pnl):
+                self._sell_all(now, f"日內熔斷: 虧損 ${abs(daily_pnl):,.0f}")
+                self.log_message(f"[HALT] 日內虧損已達上限，停止交易")
+                return
+
+            return  # 已有持倉，不再開新倉
+
+        # --- Step 4: 檢查入場條件 ---
+        if mu_position is not None and float(mu_position.quantity) > 0:
+            return  # 已有持倉
+
+        # 交易許可檢查
+        daily_pnl = portfolio_value - self._day_start_value
+        can_trade, reason = self.risk_mgr.can_trade(daily_pnl, self.risk_mgr.daily_trade_count)
+        if not can_trade:
+            return
+
+        # 時間窗口檢查（僅分鐘模式）
+        if self.intraday_mode:
+            current_time = now.time() if hasattr(now, 'time') else now
+            if self.risk_mgr.is_no_trade_window(current_time if isinstance(current_time, time) else now.time()):
+                return
+
+        # 三層決策
+        trade_signal = self._run_three_layer_decision(indicators, idx)
+        if trade_signal.action != "BUY":
+            return
+
+        # 計算倉位
+        atr = indicators["mu_atr"].iloc[idx]
+        capital = self.get_cash()
+        shares = self.risk_mgr.compute_position_size(capital, atr, mu_price)
+
+        if shares <= 0:
+            self.log_message(f"[{now}] 倉位計算為 0，跳過")
+            return
+
+        # --- Step 5: 執行買入 ---
+        order = self.create_order(TRADE_SYMBOL, shares, "buy")
+        self.submit_order(order)
+        self.risk_mgr.increment_trade_count()
+        self._has_position = True
+        self._entry_price = mu_price
+
+        self.log_message(
+            f"[BUY] {now} | {trade_signal.reason} | "
+            f"shares={shares} @ ${mu_price:.2f} | "
+            f"ATR={atr:.2f} | 資金=${capital:,.0f}"
+        )
+
+        # --- Step 6: 日誌 ---
+        self.log_message(
+            f"[Status] portfolio=${portfolio_value:,.2f} | "
+            f"cash=${self.get_cash():,.2f} | "
+            f"daily_trades={self.risk_mgr.daily_trade_count} | "
+            f"daily_pnl=${daily_pnl:,.2f}"
+        )
+
+    # ------------------------------------------------------------------
+    # 三層決策整合
+    # ------------------------------------------------------------------
+    def _run_three_layer_decision(self, indicators: dict, idx: int) -> Signal:
+        """
+        執行三層決策流程。
+
+        Args:
+            indicators: 指標 dict。
+            idx: 當前 bar 索引。
+
+        Returns:
+            Signal: 最終交易訊號。
+        """
+        # Layer 1: 母系統 — 板塊情緒
+        smh_close = indicators["smh_close"].iloc[idx]
+        smh_vwap = indicators["smh_vwap"].iloc[idx]
+        vix_spike = False  # Yahoo 日線模式下不檢查 VIX（可選）
+
+        sentiment_ok, sentiment_reason = check_market_sentiment(smh_close, smh_vwap, vix_spike)
+        if not sentiment_ok:
+            return HOLD
+
+        # Layer 2: 核心系統 — 相對強弱
+        rs_ratio = indicators["rs_ratio"].iloc[idx]
+        rs_ratio_ema = indicators["rs_ratio_ema"].iloc[idx]
+
+        rs_ok, rs_reason = check_relative_strength(rs_ratio, rs_ratio_ema)
+        if not rs_ok:
+            return HOLD
+
+        # Layer 3: 子系統 — 微觀執行
+        mu_close = indicators["mu_close"].iloc[idx]
+        mu_vwap = indicators["mu_vwap"].iloc[idx]
+        mu_rsi = indicators["mu_rsi"].iloc[idx]
+        mu_rsi_prev = indicators["mu_rsi_prev"].iloc[idx]
+        volume_surge = bool(indicators["mu_volume_surge"].iloc[idx])
+
+        entry_ok, entry_reason = check_entry_signal(
+            mu_close, mu_vwap, mu_rsi, mu_rsi_prev, volume_surge
+        )
+        if not entry_ok:
+            return HOLD
+
+        return Signal(
+            "BUY",
+            f"三層全過: {sentiment_reason} | {rs_reason} | {entry_reason}",
+            confidence=0.85,
+        )
+
+    # ------------------------------------------------------------------
+    # 指標計算
+    # ------------------------------------------------------------------
+    def _compute_indicators(self, mu_df: pd.DataFrame, smh_df: pd.DataFrame) -> dict:
+        """
+        計算所有技術指標，返回 dict。
+
+        與 strategies/indicators.py 的 compute_all_indicators 功能相同，
+        但直接嵌入策略類以避免導入循環依賴；在不使用 VIX 的情境下更簡潔。
+        """
+        indicators = {}
+
+        mu_close = mu_df["close"]
+        mu_high = mu_df["high"]
+        mu_low = mu_df["low"]
+        mu_volume = mu_df["volume"]
+        smh_close = smh_df["close"]
+
+        # MU 原始數據
+        indicators["mu_close"] = mu_close
+        indicators["mu_high"] = mu_high
+        indicators["mu_low"] = mu_low
+        indicators["mu_volume"] = mu_volume
+
+        # MU 指標
+        indicators["mu_rsi"] = compute_rsi(mu_close, period=RSI_PERIOD)
+        indicators["mu_rsi_prev"] = indicators["mu_rsi"].shift(1)
+        indicators["mu_atr"] = compute_atr(mu_high, mu_low, mu_close, period=ATR_PERIOD)
+        indicators["mu_vwap"] = compute_rolling_vwap(mu_close, period=VWAP_LOOKBACK)
+        indicators["mu_ema_fast"] = compute_ema(mu_close, period=5)
+        indicators["mu_ema_slow"] = compute_ema(mu_close, period=EMA_SLOW)
+        indicators["mu_volume_ma"] = compute_volume_ma(mu_volume, period=VOLUME_MA_PERIOD)
+        indicators["mu_volume_surge"] = mu_volume > (indicators["mu_volume_ma"] * VOLUME_SURGE_MULTIPLIER)
+
+        bb = compute_bollinger_bands(mu_close, period=BB_PERIOD, num_std=BB_STD_MULTIPLIER)
+        indicators["mu_bb_upper"] = bb["bb_upper"]
+        indicators["mu_bb_lower"] = bb["bb_lower"]
+        indicators["mu_bb_middle"] = bb["bb_middle"]
+
+        # SMH 原始數據與指標
+        indicators["smh_close"] = smh_close
+        indicators["smh_vwap"] = compute_rolling_vwap(smh_close, period=VWAP_LOOKBACK)
+
+        # RS Ratio
+        indicators["rs_ratio"] = compute_rs_ratio(mu_close, smh_close)
+        indicators["rs_ratio_ema"] = compute_rs_ratio_ema(indicators["rs_ratio"], period=RS_EMA_PERIOD)
+
+        return indicators
+
+    # ------------------------------------------------------------------
+    # 訂單輔助方法
+    # ------------------------------------------------------------------
+    def _sell_all(self, now, reason: str) -> None:
+        """賣出全部 MU 持倉。"""
+        positions = self.get_positions()
+        for p in positions:
+            if p.asset == TRADE_SYMBOL and float(p.quantity) > 0:
+                order = self.create_order(TRADE_SYMBOL, float(p.quantity), "sell")
+                self.submit_order(order)
+                self._has_position = False
+                self.log_message(f"[SELL ALL] {now} | {reason} | qty={p.quantity}")
+                return
+
+    def _sell_partial(self, quantity: int, now, reason: str) -> None:
+        """賣出部分 MU 持倉。"""
+        if quantity <= 0:
+            return
+        order = self.create_order(TRADE_SYMBOL, quantity, "sell")
+        self.submit_order(order)
+        self.log_message(f"[SELL 50%] {now} | {reason} | qty={quantity}")

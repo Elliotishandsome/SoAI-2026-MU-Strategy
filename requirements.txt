@@ -1,5 +1,6 @@
-lumibot
+lumibot>=4.5.0
 python-dotenv
-pandas
-numpy
+pandas>=2.0.0
+numpy>=1.24.0
 scikit-learn
+yfinance>=0.2.0
