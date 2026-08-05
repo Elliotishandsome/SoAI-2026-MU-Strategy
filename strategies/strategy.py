@@ -123,6 +123,8 @@ class Strategy(_LumibotStrategy):
         # --- 策略狀態 ---
         self._has_position = False
         self._entry_price = 0.0
+        # 持倉階段狀態機: 0=空倉 / 1=全倉 / 2=底倉(已平50%)
+        self._position_stage = 0
         self._daily_pnl = 0.0
         self._indicators_cache: dict | None = None
         self._last_indicator_idx: int = -1
@@ -204,17 +206,18 @@ class Strategy(_LumibotStrategy):
                 bb_upper=indicators["mu_bb_upper"].iloc[idx],
                 rsi=indicators["mu_rsi"].iloc[idx],
                 ema_slow=indicators["mu_ema_slow"].iloc[idx],
+                position_stage=self._position_stage,
             )
             for sig in exit_signals:
                 if sig.action == "SELL_STOP":
                     self._sell_all(now, sig.reason)
                     self.risk_mgr.increment_trade_count()
-                    self._has_position = False
-                    break
                 elif sig.action == "SELL_TAKE_PROFIT":
                     qty = self.risk_mgr.compute_take_profit_quantity(int(float(mu_position.quantity)))
                     self._sell_partial(qty, now, sig.reason)
                     self.risk_mgr.increment_trade_count()
+                    # 平掉 50% 後進入底倉階段
+                    self._position_stage = 2
 
             # 檢查止損（ATR 追蹤止損）
             if self._has_position and self._entry_price > 0:
@@ -223,7 +226,6 @@ class Strategy(_LumibotStrategy):
                 if mu_price <= stop_price:
                     self._sell_all(now, f"ATR 追蹤止損: 價格 {mu_price:.2f} ≤ 止損價 {stop_price:.2f}")
                     self.risk_mgr.increment_trade_count()
-                    self._has_position = False
 
             # 檢查強制清倉時間（僅分鐘模式，美東時區）
             if self.intraday_mode:
@@ -231,7 +233,6 @@ class Strategy(_LumibotStrategy):
                 if self.risk_mgr.is_force_close_time(now_ny.time()):
                     self._sell_all(now, "15:55 強制清倉")
                     self.risk_mgr.increment_trade_count()
-                    self._has_position = False
 
             # 檢查日內熔斷
             daily_pnl = portfolio_value - self._day_start_value
@@ -277,6 +278,7 @@ class Strategy(_LumibotStrategy):
         self.submit_order(order)
         self.risk_mgr.increment_trade_count()
         self._has_position = True
+        self._position_stage = 1  # 全倉
         self._entry_price = mu_price
 
         self.log_message(
@@ -459,13 +461,14 @@ class Strategy(_LumibotStrategy):
     # 訂單輔助方法
     # ------------------------------------------------------------------
     def _sell_all(self, now, reason: str) -> None:
-        """賣出全部 MU 持倉。"""
+        """賣出全部 MU 持倉，並重置持倉狀態機（_has_position / _position_stage）。"""
         positions = self.get_positions()
         for p in positions:
             if p.symbol == TRADE_SYMBOL and float(p.quantity) > 0:
                 order = self.create_order(TRADE_SYMBOL, float(p.quantity), "sell")
                 self.submit_order(order)
                 self._has_position = False
+                self._position_stage = 0  # 空倉
                 self.log_message(f"[SELL ALL] {now} | {reason} | qty={p.quantity}")
                 return
 

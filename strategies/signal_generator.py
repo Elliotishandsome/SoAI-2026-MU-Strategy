@@ -158,34 +158,65 @@ def check_exit_signals(
     bb_upper: float,
     rsi: float,
     ema_slow: float,
+    position_stage: int = 1,
 ) -> list[Signal]:
     """
-    檢查所有出場條件。
+    出場狀態機（同一根 bar 最多回傳一個訊號）。
 
-    出場規則:
-      1. RSI(14) > 70 → 動能過熱，平倉 50% 鎖利。
-      2. 價格觸及布林帶上軌 → 平倉 50%。
-      3. 價格跌破 20-EMA → 清倉剩餘頭寸。
+    狀態定義:
+        position_stage = 1  → 全倉
+        position_stage = 2  → 底倉（已平倉 50%）
+
+    規則:
+      - 全倉 (stage=1):
+          若 RSI(14) > 70 或 價格觸及布林帶上軌 → 平倉 50% 鎖利 (SELL_TAKE_PROFIT)
+          若 價格跌破 20-EMA → 全數清倉 (SELL_STOP)（保命優先）
+      - 底倉 (stage=2):
+          若 價格跌破 20-EMA → 全數清倉 (SELL_STOP)
+
+    兩個止盈條件以 ``or`` 合併，避免同一根 bar 觸發兩次 50% 平倉。
 
     Args:
         price: 當前價格。
         bb_upper: 布林帶上軌。
         rsi: 當前 RSI。
         ema_slow: 20-EMA。
+        position_stage: 當前持倉階段（1=全倉, 2=底倉）。
 
     Returns:
-        list[Signal]: 出場訊號列表（可能為空）。
+        list[Signal]: 最多一個出場訊號；無觸發時返回空列表。
     """
-    signals = []
+    signals: list[Signal] = []
 
+    # --- 跌破 20-EMA 一律全清（優先於止盈） ---
     if price <= ema_slow:
-        signals.append(Signal("SELL_STOP", f"價格 {price:.2f} 跌破 20-EMA {ema_slow:.2f} — 全數清倉", confidence=1.0))
+        stage_label = "底倉" if position_stage == 2 else "全倉"
+        signals.append(
+            Signal(
+                "SELL_STOP",
+                f"{stage_label}價格 {price:.2f} 跌破 20-EMA {ema_slow:.2f} — 全數清倉",
+                confidence=1.0,
+            )
+        )
+        return signals
 
-    if rsi > 70:
-        signals.append(Signal("SELL_TAKE_PROFIT", f"RSI {rsi:.1f} > 70 過熱 — 平倉 50% 鎖利", confidence=0.8))
-
-    if price >= bb_upper:
-        signals.append(Signal("SELL_TAKE_PROFIT", f"價格 {price:.2f} 觸及布林帶上軌 {bb_upper:.2f} — 平倉 50%", confidence=0.7))
+    # --- 僅全倉階段檢查止盈（or 合併，只平 50%） ---
+    if position_stage == 1:
+        hit_upper = not pd.isna(bb_upper) and price >= bb_upper
+        rsi_overheat = not pd.isna(rsi) and rsi > 70
+        if hit_upper or rsi_overheat:
+            reasons = []
+            if hit_upper:
+                reasons.append(f"價格 {price:.2f} 觸及布林帶上軌 {bb_upper:.2f}")
+            if rsi_overheat:
+                reasons.append(f"RSI {rsi:.1f} > 70 過熱")
+            signals.append(
+                Signal(
+                    "SELL_TAKE_PROFIT",
+                    f"{' 或 '.join(reasons)} — 平倉 50% 鎖利",
+                    confidence=0.8,
+                )
+            )
 
     return signals
 
@@ -252,13 +283,14 @@ def generate_signals(indicators: dict, idx: int) -> list[Signal]:
     return signals
 
 
-def check_exit_for_position(indicators: dict, idx: int) -> list[Signal]:
+def check_exit_for_position(indicators: dict, idx: int, position_stage: int = 1) -> list[Signal]:
     """
     僅檢查出場條件（用於已持倉時）。
 
     Args:
         indicators: compute_all_indicators() 輸出。
         idx: 當前時間索引。
+        position_stage: 持倉階段（1=全倉, 2=底倉）。
 
     Returns:
         list[Signal]: 出場訊號。
@@ -275,5 +307,5 @@ def check_exit_for_position(indicators: dict, idx: int) -> list[Signal]:
     rsi = _get("mu_rsi", np.nan)
     ema_slow = _get("mu_ema_slow", np.nan)
 
-    exit_signals = check_exit_signals(price, bb_upper, rsi, ema_slow)
+    exit_signals = check_exit_signals(price, bb_upper, rsi, ema_slow, position_stage=position_stage)
     return exit_signals if exit_signals else [HOLD]
