@@ -40,6 +40,7 @@ from strategies.params import (
     INITIAL_CAPITAL,
     SLEEPTIME,
     RESAMPLE_MINUTES,
+    REQUIRE_SMH,
     BUY_COMMISSION_BPS,
     SELL_COMMISSION_BPS,
     MAX_RISK_RATIO,
@@ -125,6 +126,7 @@ class Strategy(_LumibotStrategy):
         self._entry_price = 0.0
         # 持倉階段狀態機: 0=空倉 / 1=全倉 / 2=底倉(已平50%)
         self._position_stage = 0
+        self._smh_available = False  # SMH 數據是否可用（不可用時降級模式）
         self._daily_pnl = 0.0
         self._indicators_cache: dict | None = None
         self._last_indicator_idx: int = -1
@@ -167,8 +169,14 @@ class Strategy(_LumibotStrategy):
         smh_price = self.get_last_price(SECTOR_ETF)
 
         if mu_price is None or smh_price is None:
-            self.log_message(f"[{now}] 價格數據缺失，跳過本週期")
-            return
+            if mu_price is None:
+                self.log_message(f"[{now}] MU 價格缺失，跳過本週期")
+                return
+            # SMH 缺失 → 降級模式（僅當 REQUIRE_SMH=False 時繼續）
+            self._smh_available = False
+            if REQUIRE_SMH:
+                self.log_message(f"[{now}] SMH 數據缺失且 REQUIRE_SMH=True，停止交易")
+                return
 
         # --- Step 2: 取歷史數據並計算指標 ---
         lookback = self._get_lookback()
@@ -176,19 +184,23 @@ class Strategy(_LumibotStrategy):
         if self.intraday_mode:
             # 分鐘模式：請求 1 分鐘 bar，然後重取樣為 RESAMPLE_MINUTES 分鐘 K 線
             mu_bars = self.get_historical_prices(TRADE_SYMBOL, length=lookback, timestep="minute")
-            smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="minute")
+            smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="minute") if self._smh_available else None
         else:
             mu_bars = self.get_historical_prices(TRADE_SYMBOL, length=lookback, timestep="day")
-            smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="day")
+            smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="day") if self._smh_available else None
 
-        if mu_bars is None or smh_bars is None:
+        if mu_bars is None or mu_bars.df is None or mu_bars.df.empty:
             return
 
         mu_df = self._prepare_bars_df(mu_bars.df)
-        smh_df = self._prepare_bars_df(smh_bars.df)
+        smh_df = self._prepare_bars_df(smh_bars.df) if (smh_bars is not None and smh_bars.df is not None) else pd.DataFrame()
 
-        if mu_df.empty or smh_df.empty:
+        if mu_df.empty:
             return
+
+        # SMH 歷史數據空 → 降級模式
+        if smh_df.empty:
+            self._smh_available = False
 
         # 計算指標
         indicators = self._compute_indicators(mu_df, smh_df)
@@ -365,6 +377,10 @@ class Strategy(_LumibotStrategy):
         """
         執行三層決策流程。
 
+        SMH 數據缺失時進入降級模式：
+          - Layer 1 改用 MU 自身價格 vs MU VWAP（自我板塊情緒檢查）
+          - Layer 2 跳過（RS_Ratio 無法計算，視為通過）
+
         Args:
             indicators: 指標 dict。
             idx: 當前 bar 索引。
@@ -372,24 +388,39 @@ class Strategy(_LumibotStrategy):
         Returns:
             Signal: 最終交易訊號。
         """
-        # Layer 1: 母系統 — 板塊情緒
-        smh_close = indicators["smh_close"].iloc[idx]
-        smh_vwap = indicators["smh_vwap"].iloc[idx]
-        vix_spike = False  # Yahoo 日線模式下不檢查 VIX（可選）
+        # ------------------------------------------------------------------
+        # Layer 1: 母系統 — 板塊情緒（SMH 缺失 → MU 自我檢查降級）
+        # ------------------------------------------------------------------
+        vix_spike = False  # 日線/分鐘模式暫不檢查 VIX
 
-        sentiment_ok, sentiment_reason = check_market_sentiment(smh_close, smh_vwap, vix_spike)
+        if not self._smh_available:
+            mu_close_l1 = indicators["mu_close"].iloc[idx]
+            mu_vwap_l1 = indicators["mu_vwap"].iloc[idx]
+            sentiment_ok, sentiment_reason = check_market_sentiment(mu_close_l1, mu_vwap_l1, vix_spike)
+            sentiment_reason += " [SMH 缺失，降級為 MU 自我檢查]"
+        else:
+            smh_close = indicators["smh_close"].iloc[idx]
+            smh_vwap = indicators["smh_vwap"].iloc[idx]
+            sentiment_ok, sentiment_reason = check_market_sentiment(smh_close, smh_vwap, vix_spike)
+
         if not sentiment_ok:
             return HOLD
 
-        # Layer 2: 核心系統 — 相對強弱
-        rs_ratio = indicators["rs_ratio"].iloc[idx]
-        rs_ratio_ema = indicators["rs_ratio_ema"].iloc[idx]
+        # ------------------------------------------------------------------
+        # Layer 2: 核心系統 — 相對強弱（SMH 缺失 → 跳過）
+        # ------------------------------------------------------------------
+        if self._smh_available:
+            rs_ratio = indicators["rs_ratio"].iloc[idx]
+            rs_ratio_ema = indicators["rs_ratio_ema"].iloc[idx]
+            rs_ok, rs_reason = check_relative_strength(rs_ratio, rs_ratio_ema)
+            if not rs_ok:
+                return HOLD
+        else:
+            rs_reason = "RS_Ratio 不可計算 [SMH 缺失，跳過]"
 
-        rs_ok, rs_reason = check_relative_strength(rs_ratio, rs_ratio_ema)
-        if not rs_ok:
-            return HOLD
-
+        # ------------------------------------------------------------------
         # Layer 3: 子系統 — 微觀執行
+        # ------------------------------------------------------------------
         mu_close = indicators["mu_close"].iloc[idx]
         mu_vwap = indicators["mu_vwap"].iloc[idx]
         mu_rsi = indicators["mu_rsi"].iloc[idx]
@@ -424,7 +455,7 @@ class Strategy(_LumibotStrategy):
         mu_high = mu_df["high"]
         mu_low = mu_df["low"]
         mu_volume = mu_df["volume"]
-        smh_close = smh_df["close"]
+        smh_close = smh_df["close"] if (smh_df is not None and not smh_df.empty) else None
 
         # MU 原始數據
         indicators["mu_close"] = mu_close
@@ -447,13 +478,20 @@ class Strategy(_LumibotStrategy):
         indicators["mu_bb_lower"] = bb["bb_lower"]
         indicators["mu_bb_middle"] = bb["bb_middle"]
 
-        # SMH 原始數據與指標
-        indicators["smh_close"] = smh_close
-        indicators["smh_vwap"] = compute_rolling_vwap(smh_close, period=VWAP_LOOKBACK)
+        # SMH 原始數據與指標（SMH 缺失時進入降級模式，rs_ratio 設為 None）
+        if smh_df is not None and not smh_df.empty:
+            smh_close = smh_df["close"]
+            indicators["smh_close"] = smh_close
+            indicators["smh_vwap"] = compute_rolling_vwap(smh_close, period=VWAP_LOOKBACK)
 
-        # RS Ratio
-        indicators["rs_ratio"] = compute_rs_ratio(mu_close, smh_close)
-        indicators["rs_ratio_ema"] = compute_rs_ratio_ema(indicators["rs_ratio"], period=RS_EMA_PERIOD)
+            # RS Ratio
+            indicators["rs_ratio"] = compute_rs_ratio(mu_close, smh_close)
+            indicators["rs_ratio_ema"] = compute_rs_ratio_ema(indicators["rs_ratio"], period=RS_EMA_PERIOD)
+        else:
+            indicators["smh_close"] = None
+            indicators["smh_vwap"] = None
+            indicators["rs_ratio"] = None
+            indicators["rs_ratio_ema"] = None
 
         return indicators
 
