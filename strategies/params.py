@@ -16,10 +16,11 @@
 # 1. 交易標的 & 數據源
 # ============================================================================
 
-# 主交易標的
-TRADE_SYMBOL = "MU"
+# 主交易標的（v2.7：支援多標的）
+TRADE_SYMBOL = "MU"                    # 主要標的（日誌/兼容用）
+TRADE_SYMBOLS = ["MU", "AMD"]          # 可交易標的（每個獨立持倉管理）
 
-# 輔助標的（用於相對強弱 RS = MU/SMH）
+# 輔助標的（用於相對強弱 RS = 個股/SMH）
 SECTOR_ETF = "SMH"       # 半導體板塊 ETF（替代 SPY 作為板塊參照）
 VOLATILITY_INDEX = "^VIX"  # 恐慌指數（Yahoo 代碼為 ^VIX；v2 暫不強制使用）
 
@@ -50,8 +51,8 @@ LAST_ENTRY_TIME_HOUR = 15
 LAST_ENTRY_TIME_MINUTE = 50
 
 # CSV 數據模式（Pandas backtest）使用的標的清單
-# MU 主標的 + SMH 板塊 ETF（Layer1 RS 相對強弱需要）—— 已解綁 SPY
-STOCK_SLEEVE_SYMBOLS = [TRADE_SYMBOL, SECTOR_ETF]
+# 交易標的（MU + AMD）+ SMH 板塊 ETF（Layer1 RS 相對強弱需要）—— 已解綁 SPY
+STOCK_SLEEVE_SYMBOLS = TRADE_SYMBOLS + [SECTOR_ETF]
 CRYPTO_SLEEVE_SYMBOLS: list[str] = []
 STOCK_BENCH = BENCHMARK
 CRYPTO_BENCH = BENCHMARK

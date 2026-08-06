@@ -34,6 +34,7 @@ from lumibot.strategies import Strategy as _LumibotStrategy
 
 from strategies.params import (
     TRADE_SYMBOL,
+    TRADE_SYMBOLS,
     SECTOR_ETF,
     VOLATILITY_INDEX,
     BENCHMARK,
@@ -123,12 +124,15 @@ class Strategy(_LumibotStrategy):
             take_profit_ratio=TAKE_PROFIT_RATIO,
         )
 
-        # --- 策略狀態 ---
-        self._has_position = False
-        self._position_quantity = 0.0  # 追蹤實際持倉股數（get_positions 兜底）
-        self._entry_price = 0.0
-        # 持倉階段狀態機: 0=空倉 / 1=全倉 / 2=底倉(已平50%)
-        self._position_stage = 0
+        # --- 策略狀態（v2.7：per-symbol） ---
+        self._pos = {}
+        for _s in TRADE_SYMBOLS:
+            self._pos[_s] = {
+                "has": False,     # 持倉標記
+                "qty": 0.0,       # 追蹤股數（get_positions 兜底）
+                "stage": 0,       # 0=空倉 / 1=全倉 / 2=底倉(已平50%)
+                "entry": 0.0,     # 進場價
+            }
         self._smh_available = False  # SMH 數據是否可用（不可用時降級模式）
         self._daily_pnl = 0.0
         self._indicators_cache: dict | None = None
@@ -141,8 +145,8 @@ class Strategy(_LumibotStrategy):
         self._day_start_value = self.get_portfolio_value()
 
         self.log_message(
-            f"[MU Strategy] 初始化完成 | 模式={'intraday' if self.intraday_mode else 'daily'} | "
-            f"sleeptime={self.sleeptime} | 初始資金=${INITIAL_CAPITAL:,.0f}"
+            f"[MultiSymbol Strategy] 初始化完成 | 模式={'intraday' if self.intraday_mode else 'daily'} | "
+            f"sleeptime={self.sleeptime} | 標的={TRADE_SYMBOLS} | 初始資金=${INITIAL_CAPITAL:,.0f}"
         )
 
     # ------------------------------------------------------------------
@@ -150,10 +154,10 @@ class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
     def on_trading_iteration(self):
         """
-        每次 sleeptime 觸發時執行。
+        每次 sleeptime 觸發時執行（v2.7：多標的）。
 
-        流程：
-          1. 獲取市場數據（MU, SMH, VIX）
+        對 TRADE_SYMBOLS 中的每個標的獨立執行：
+          1. 獲取市場數據（個股, SMH）
           2. 計算技術指標
           3. 檢查持倉 → 出場邏輯
           4. 檢查風控 → 入場邏輯
@@ -167,109 +171,110 @@ class Strategy(_LumibotStrategy):
         if self.risk_mgr.is_halted():
             return  # 熔斷中，不做任何操作
 
-        # --- Step 1: 獲取市場數據 ---
-        mu_price = self.get_last_price(TRADE_SYMBOL)
+        # --- SMH 板塊數據（各標的共用，一次獲取） ---
         smh_price = self.get_last_price(SECTOR_ETF)
-
-        # SMH 可用性（缺失時進入降級模式）
         self._smh_available = smh_price is not None
-
-        if mu_price is None:
-            self.log_message(f"[{now}] MU 價格缺失，跳過本週期")
-            return
 
         if not self._smh_available and REQUIRE_SMH:
             self.log_message(f"[{now}] SMH 數據缺失且 REQUIRE_SMH=True，停止交易")
             return
 
-        # --- Step 2: 取歷史數據並計算指標 ---
         lookback = self._get_lookback()
-
         if self.intraday_mode:
-            # 分鐘模式：請求 1 分鐘 bar，然後重取樣為 RESAMPLE_MINUTES 分鐘 K 線
-            mu_bars = self.get_historical_prices(TRADE_SYMBOL, length=lookback, timestep="minute")
             smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="minute") if self._smh_available else None
         else:
-            mu_bars = self.get_historical_prices(TRADE_SYMBOL, length=lookback, timestep="day")
             smh_bars = self.get_historical_prices(SECTOR_ETF, length=lookback, timestep="day") if self._smh_available else None
 
-        if mu_bars is None or mu_bars.df is None or mu_bars.df.empty:
-            return
-
-        mu_df = self._prepare_bars_df(mu_bars.df)
         smh_df = self._prepare_bars_df(smh_bars.df) if (smh_bars is not None and smh_bars.df is not None) else pd.DataFrame()
-
-        if mu_df.empty:
-            return
-
-        # SMH 歷史數據空 → 降級模式
         if smh_df.empty:
             self._smh_available = False
 
-        # 計算指標
-        indicators = self._compute_indicators(mu_df, smh_df)
+        # --- 對每個交易標的獨立決策 ---
+        for symbol in TRADE_SYMBOLS:
+            self._process_symbol(symbol, now, portfolio_value, smh_df)
+
+    # ------------------------------------------------------------------
+    # 單標的處理流程（多標的時逐一呼叫）
+    # ------------------------------------------------------------------
+    def _process_symbol(self, symbol: str, now: datetime, portfolio_value: float, smh_df: pd.DataFrame):
+        """對單一 symbol 執行出場/入場決策（持倉狀態獨立管理）。"""
+        price = self.get_last_price(symbol)
+        if price is None:
+            return
+
+        lookback = self._get_lookback()
+        if self.intraday_mode:
+            bars = self.get_historical_prices(symbol, length=lookback, timestep="minute")
+        else:
+            bars = self.get_historical_prices(symbol, length=lookback, timestep="day")
+        if bars is None or bars.df is None or bars.df.empty:
+            return
+
+        df = self._prepare_bars_df(bars.df)
+        if df.empty:
+            return
+
+        indicators = self._compute_indicators(symbol, df, smh_df)
         self._indicators_cache = indicators
         self._indicators_ready = True
         idx = -1  # 最新一根 bar
+        sym = symbol.lower()
 
         # --- Step 3: 檢查現有持倉的出場訊號 ---
         positions = self.get_positions()
-        mu_position = next((p for p in positions if p.symbol == TRADE_SYMBOL), None)
+        sym_position = next((p for p in positions if p.symbol == symbol), None)
+        pos = self._pos[symbol]
 
-        # 有倉位：以 get_positions 為主，self._has_position 兜底（訂單結算延遲時仍能出場）
-        has_position = (mu_position is not None and float(mu_position.quantity) > 0) or self._has_position
+        # 有倉位：以 get_positions 為主，pos["has"] 兜底（訂單結算延遲時仍能出場）
+        has_position = (sym_position is not None and float(sym_position.quantity) > 0) or pos["has"]
 
         if has_position:
             exit_signals = check_exit_signals(
-                price=indicators["mu_close"].iloc[idx],
-                bb_upper=indicators["mu_bb_upper"].iloc[idx],
-                rsi=indicators["mu_rsi"].iloc[idx],
-                ema_slow=indicators["mu_ema_slow"].iloc[idx],
-                position_stage=self._position_stage,
+                price=indicators[f"{sym}_close"].iloc[idx],
+                bb_upper=indicators[f"{sym}_bb_upper"].iloc[idx],
+                rsi=indicators[f"{sym}_rsi"].iloc[idx],
+                ema_slow=indicators[f"{sym}_ema_slow"].iloc[idx],
+                position_stage=pos["stage"],
             )
             for sig in exit_signals:
                 if sig.action == "SELL_STOP":
-                    self._sell_all(now, sig.reason)
+                    self._sell_all(symbol, now, sig.reason)
                     self.risk_mgr.increment_trade_count()
                 elif sig.action == "SELL_TAKE_PROFIT":
-                    qty = self.risk_mgr.compute_take_profit_quantity(int(float(mu_position.quantity)))
-                    self._sell_partial(qty, now, sig.reason)
-                    self.risk_mgr.increment_trade_count()
-                    # 平掉 50% 後進入底倉階段
-                    self._position_stage = 2
+                    if sym_position is not None:
+                        qty = self.risk_mgr.compute_take_profit_quantity(int(float(sym_position.quantity)))
+                        self._sell_partial(symbol, qty, now, sig.reason)
+                        self.risk_mgr.increment_trade_count()
+                        pos["stage"] = 2  # 平掉 50% 後進入底倉階段
 
             # 檢查止損（ATR 追蹤止損）
-            if self._has_position and self._entry_price > 0:
-                atr = indicators["mu_atr"].iloc[idx]
-                stop_price = self._entry_price - ATR_STOP_MULTIPLIER * atr
-                if mu_price <= stop_price:
-                    self._sell_all(now, f"ATR 追蹤止損: 價格 {mu_price:.2f} ≤ 止損價 {stop_price:.2f}")
+            if pos["has"] and pos["entry"] > 0:
+                atr = indicators[f"{sym}_atr"].iloc[idx]
+                stop_price = pos["entry"] - ATR_STOP_MULTIPLIER * atr
+                if price <= stop_price:
+                    self._sell_all(symbol, now, f"ATR 追蹤止損: 價格 {price:.2f} ≤ 止損價 {stop_price:.2f}")
                     self.risk_mgr.increment_trade_count()
 
             # 檢查強制清倉時間（僅分鐘模式，美東時區）
             if self.intraday_mode:
                 now_ny = now.astimezone(self._ny_tz)
                 if self.risk_mgr.is_force_close_time(now_ny.time()):
-                    self._sell_all(now, "15:55 強制清倉")
+                    self._sell_all(symbol, now, "15:55 強制清倉")
                     self.risk_mgr.increment_trade_count()
 
             # 檢查日內熔斷
             daily_pnl = portfolio_value - self._day_start_value
             if self.risk_mgr.should_halt(daily_pnl):
-                self._sell_all(now, f"日內熔斷: 虧損 ${abs(daily_pnl):,.0f}")
+                self._sell_all(symbol, now, f"日內熔斷: 虧損 ${abs(daily_pnl):,.0f}")
                 self.log_message(f"[HALT] 日內虧損已達上限，停止交易")
                 return
 
-            # v2.4：底倉階段（stage=2，已平 50%）允許再開新倉 — 一天可做多個波段。
-            # 全倉階段（stage=1）仍不開新倉，避免倉位無序疊加。
-            if self._position_stage != 2:
+            # v2.4：底倉階段（stage=2，已平 50%）允許再開新倉
+            if pos["stage"] != 2:
                 return  # 全倉階段，不再開新倉
-            # stage==2 → 繼續走入場邏輯（下方不 return）
 
         # --- Step 4: 檢查入場條件 ---
-        # 全倉已於上方 return；底倉（stage=2）允許再開新倉。
-        # 僅擋非 stage=2 的殘留持倉狀態（理論上不會到達）。
-        if mu_position is not None and float(mu_position.quantity) > 0 and self._position_stage != 2:
+        if sym_position is not None and float(sym_position.quantity) > 0 and pos["stage"] != 2:
             return
 
         # 交易許可檢查
@@ -284,41 +289,39 @@ class Strategy(_LumibotStrategy):
             if self.risk_mgr.is_no_trade_window(now_ny.time()):
                 return
 
-            # 15:50 後禁止開新倉（Lumibot 15:55 後不再迭代，
-            # 此刻買入將無法當日強制清倉，導致隔夜持倉）
+            # 15:50 後禁止開新倉
             last_entry = time(LAST_ENTRY_TIME_HOUR, LAST_ENTRY_TIME_MINUTE)
             if now_ny.time() >= last_entry:
-                self.log_message(f"[{now}] 已過最後開倉時間 {last_entry}，跳過")
+                self.log_message(f"[{now}] {symbol} 已過最後開倉時間 {last_entry}，跳過")
                 return
 
         # 三層決策
-        trade_signal = self._run_three_layer_decision(indicators, idx)
+        trade_signal = self._run_three_layer_decision(symbol, indicators, idx)
         if trade_signal.action != "BUY":
             return
 
         # 計算倉位
-        atr = indicators["mu_atr"].iloc[idx]
+        atr = indicators[f"{sym}_atr"].iloc[idx]
         capital = self.get_cash()
-        shares = self.risk_mgr.compute_position_size(capital, atr, mu_price)
+        shares = self.risk_mgr.compute_position_size(capital, atr, price)
 
         if shares <= 0:
-            self.log_message(f"[{now}] 倉位計算為 0，跳過")
+            self.log_message(f"[{now}] {symbol} 倉位計算為 0，跳過")
             return
 
         # --- Step 5: 執行買入 ---
-        order = self.create_order(TRADE_SYMBOL, shares, "buy")
+        order = self.create_order(symbol, shares, "buy")
         self.submit_order(order)
         self.risk_mgr.increment_trade_count()
-        self._has_position = True
-        self._position_quantity += float(shares)
-        # 底倉（stage=2）再加倉 → 回到全倉階段（stage=1），
-        # 讓新波段享有完整的止盈/止損管理（鎖利 50% 後再回 stage=2）
-        self._position_stage = 1  # 全倉
-        self._entry_price = mu_price
+        pos["has"] = True
+        pos["qty"] += float(shares)
+        # 底倉（stage=2）再加倉 → 回到全倉階段（stage=1）
+        pos["stage"] = 1  # 全倉
+        pos["entry"] = price
 
         self.log_message(
-            f"[BUY] {now} | {trade_signal.reason} | "
-            f"shares={shares} @ ${mu_price:.2f} | "
+            f"[BUY] {now} | {symbol} | {trade_signal.reason} | "
+            f"shares={shares} @ ${price:.2f} | "
             f"ATR={atr:.2f} | 資金=${capital:,.0f}"
         )
 
@@ -396,52 +399,52 @@ class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
     # 三層決策整合
     # ------------------------------------------------------------------
-    def _run_three_layer_decision(self, indicators: dict, idx: int) -> Signal:
+    def _run_three_layer_decision(self, symbol: str, indicators: dict, idx: int) -> Signal:
         """
-        執行三層決策流程（v2 — 相對強弱制）。
+        執行三層決策流程（v2 — 相對強弱制，v2.7 多標的）。
 
         三層架構：
-          Layer 1 母系統 — RS 相對強弱（RS = MU/SMH > RS_EMA）
+          Layer 1 母系統 — RS 相對強弱（RS = 個股/SMH > RS_EMA）
           Layer 2 核心系統 — 價格突破 VWAP
           Layer 3 子系統 — RSI 動能 + 放量確認
 
         SMH 數據缺失時進入降級模式：
-          - Layer 1 改用 MU 自身動能（MU 價格 > MU 自身 VWAP）
+          - Layer 1 改用個股自身動能（價格 > 自身 VWAP）
           - RS_Ratio 無法計算時視為通過
 
         Args:
-            indicators: 指標 dict。
+            symbol: 交易標的（如 "MU"、"AMD"）。
+            indicators: 指標 dict（鍵前綴 = symbol.lower()）。
             idx: 當前 bar 索引。
 
         Returns:
             Signal: 最終交易訊號。
         """
+        sym = symbol.lower()
         # ------------------------------------------------------------------
         # 大趨勢錨點：Daily VWAP（價格 > Daily VWAP = 今日多頭控盤）
-        # 5 分鐘的突破必須有「今天機構資金站在多方」的支撐才有效；
-        # 價格在 Daily VWAP 之下 = 主力出貨日，5 分鐘買點一律作廢。
         # ------------------------------------------------------------------
-        mu_close_here = indicators["mu_close"].iloc[idx]
-        daily_vwap = indicators["mu_daily_vwap"].iloc[idx]
+        close_here = indicators[f"{sym}_close"].iloc[idx]
+        daily_vwap = indicators[f"{sym}_daily_vwap"].iloc[idx]
         if pd.isna(daily_vwap):
             return HOLD  # Daily VWAP 數據不足，保守不進場
-        if mu_close_here <= daily_vwap:
+        if close_here <= daily_vwap:
             return HOLD  # 價格在 Daily VWAP 之下 → 今日空頭控盤，買點作廢
-        trend_reason = f"DailyVWAP多頭: {mu_close_here:.2f} > 今日VWAP {daily_vwap:.2f}"
+        trend_reason = f"DailyVWAP多頭: {close_here:.2f} > 今日VWAP {daily_vwap:.2f}"
 
         # ------------------------------------------------------------------
-        # Layer 1: 母系統 — 相對強弱（SMH 缺失 → MU 自我動能降級）
+        # Layer 1: 母系統 — 相對強弱（SMH 缺失 → 個股自我動能降級）
         # ------------------------------------------------------------------
         if self._smh_available:
             rs_ratio = indicators["rs_ratio"].iloc[idx]
             rs_ratio_ema = indicators["rs_ratio_ema"].iloc[idx]
             rs_ok, rs_reason = check_relative_strength(rs_ratio, rs_ratio_ema)
         else:
-            # 降級：以 MU 自身價格 vs VWAP 作為替代動能檢查
-            mu_close_l1 = indicators["mu_close"].iloc[idx]
-            mu_vwap_l1 = indicators["mu_vwap"].iloc[idx]
-            rs_ok, rs_reason = check_vwap_break(mu_close_l1, mu_vwap_l1)
-            rs_reason += " [SMH 缺失，降級為 MU 自我動能]"
+            # 降級：以個股自身價格 vs VWAP 作為替代動能檢查
+            close_l1 = indicators[f"{sym}_close"].iloc[idx]
+            vwap_l1 = indicators[f"{sym}_vwap"].iloc[idx]
+            rs_ok, rs_reason = check_vwap_break(close_l1, vwap_l1)
+            rs_reason += " [SMH 缺失，降級為個股自我動能]"
 
         if not rs_ok:
             return HOLD
@@ -449,22 +452,22 @@ class Strategy(_LumibotStrategy):
         # ------------------------------------------------------------------
         # Layer 2: 核心系統 — 價格突破 VWAP
         # ------------------------------------------------------------------
-        mu_close = indicators["mu_close"].iloc[idx]
-        mu_vwap = indicators["mu_vwap"].iloc[idx]
-        vwap_ok, vwap_reason = check_vwap_break(mu_close, mu_vwap)
+        close_v = indicators[f"{sym}_close"].iloc[idx]
+        vwap = indicators[f"{sym}_vwap"].iloc[idx]
+        vwap_ok, vwap_reason = check_vwap_break(close_v, vwap)
         if not vwap_ok:
             return HOLD
 
         # ------------------------------------------------------------------
         # Layer 3: 子系統 — VWAP 回踩 + 動能 + 量能確認
         # ------------------------------------------------------------------
-        mu_rsi = indicators["mu_rsi"].iloc[idx]
-        mu_low = indicators["mu_low"].iloc[idx]
-        volume_surge = bool(indicators["mu_volume_surge"].iloc[idx])
-        prev_close = indicators["mu_close"].iloc[idx - 1] if idx > 0 else mu_close
+        rsi = indicators[f"{sym}_rsi"].iloc[idx]
+        low = indicators[f"{sym}_low"].iloc[idx]
+        volume_surge = bool(indicators[f"{sym}_volume_surge"].iloc[idx])
+        prev_close = indicators[f"{sym}_close"].iloc[idx - 1] if idx > 0 else close_v
 
         pullback_ok, pullback_reason = check_pullback_entry(
-            mu_close, mu_vwap, mu_low, prev_close, mu_rsi, volume_surge
+            close_v, vwap, low, prev_close, rsi, volume_surge
         )
         if not pullback_ok:
             return HOLD
@@ -478,53 +481,51 @@ class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
     # 指標計算
     # ------------------------------------------------------------------
-    def _compute_indicators(self, mu_df: pd.DataFrame, smh_df: pd.DataFrame) -> dict:
+    def _compute_indicators(self, symbol: str, mu_df: pd.DataFrame, smh_df: pd.DataFrame) -> dict:
         """
-        計算所有技術指標，返回 dict。
+        計算所有技術指標，返回 dict（鍵前綴 = symbol.lower()）。
 
-        與 strategies/indicators.py 的 compute_all_indicators 功能相同，
-        但直接嵌入策略類以避免導入循環依賴；在不使用 VIX 的情境下更簡潔。
+        Args:
+            symbol: 交易標的（如 "MU"、"AMD"）。
+            mu_df: 該標的的 OHLCV DataFrame，index 為 datetime。
+            smh_df: SMH 的 OHLCV DataFrame（可空 → 降級模式）。
         """
         indicators = {}
+        sym = symbol.lower()
 
-        mu_close = mu_df["close"]
-        mu_high = mu_df["high"]
-        mu_low = mu_df["low"]
-        mu_volume = mu_df["volume"]
-        smh_close = smh_df["close"] if (smh_df is not None and not smh_df.empty) else None
+        close = mu_df["close"]
+        high = mu_df["high"]
+        low = mu_df["low"]
+        volume = mu_df["volume"]
 
-        # MU 原始數據
-        indicators["mu_close"] = mu_close
-        indicators["mu_high"] = mu_high
-        indicators["mu_low"] = mu_low
-        indicators["mu_volume"] = mu_volume
+        # 原始數據
+        indicators[f"{sym}_close"] = close
+        indicators[f"{sym}_high"] = high
+        indicators[f"{sym}_low"] = low
+        indicators[f"{sym}_volume"] = volume
 
-        # MU 指標
-        indicators["mu_rsi"] = compute_rsi(mu_close, period=RSI_PERIOD)
-        indicators["mu_rsi_prev"] = indicators["mu_rsi"].shift(1)
-        indicators["mu_atr"] = compute_atr(mu_high, mu_low, mu_close, period=ATR_PERIOD)
-        indicators["mu_vwap"] = compute_rolling_vwap(mu_close, period=VWAP_LOOKBACK)
-        indicators["mu_ema_fast"] = compute_ema(mu_close, period=5)
-        indicators["mu_ema_slow"] = compute_ema(mu_close, period=EMA_SLOW)
-        indicators["mu_volume_ma"] = compute_volume_ma(mu_volume, period=VOLUME_MA_PERIOD)
-        indicators["mu_volume_surge"] = mu_volume > (indicators["mu_volume_ma"] * VOLUME_SURGE_MULTIPLIER)
+        # 技術指標
+        indicators[f"{sym}_rsi"] = compute_rsi(close, period=RSI_PERIOD)
+        indicators[f"{sym}_rsi_prev"] = indicators[f"{sym}_rsi"].shift(1)
+        indicators[f"{sym}_atr"] = compute_atr(high, low, close, period=ATR_PERIOD)
+        indicators[f"{sym}_vwap"] = compute_rolling_vwap(close, period=VWAP_LOOKBACK)
+        indicators[f"{sym}_ema_fast"] = compute_ema(close, period=5)
+        indicators[f"{sym}_ema_slow"] = compute_ema(close, period=EMA_SLOW)
+        indicators[f"{sym}_volume_ma"] = compute_volume_ma(volume, period=VOLUME_MA_PERIOD)
+        indicators[f"{sym}_volume_surge"] = volume > (indicators[f"{sym}_volume_ma"] * VOLUME_SURGE_MULTIPLIER)
 
-        bb = compute_bollinger_bands(mu_close, period=BB_PERIOD, num_std=BB_STD_MULTIPLIER)
-        indicators["mu_bb_upper"] = bb["bb_upper"]
-        indicators["mu_bb_lower"] = bb["bb_lower"]
-        indicators["mu_bb_middle"] = bb["bb_middle"]
+        bb = compute_bollinger_bands(close, period=BB_PERIOD, num_std=BB_STD_MULTIPLIER)
+        indicators[f"{sym}_bb_upper"] = bb["bb_upper"]
+        indicators[f"{sym}_bb_lower"] = bb["bb_lower"]
+        indicators[f"{sym}_bb_middle"] = bb["bb_middle"]
 
         # ---- 大趨勢錨點：Daily VWAP（每日開盤重置） ----
-        # 反映「今天機構資金的總體態度」：價格 > Daily VWAP = 今日多頭控盤。
-        # 以美東交易日分組，從每天開盤第一根 bar 起累計 Σ(典型價×量)/Σ(量)。
-        # 只使用已完成 bar 的資訊，無未來函數。
         if self.intraday_mode:
-            mu_idx = mu_df.index
-            if mu_idx.tz is None:
-                # CSV 模板為 UTC；無時區時先假設 UTC
-                local_idx = mu_idx.tz_localize("UTC").tz_convert(self._ny_tz)
+            idx = mu_df.index
+            if idx.tz is None:
+                local_idx = idx.tz_localize("UTC").tz_convert(self._ny_tz)
             else:
-                local_idx = mu_idx.tz_convert(self._ny_tz)
+                local_idx = idx.tz_convert(self._ny_tz)
 
             typical_price = (mu_df["high"] + mu_df["low"] + mu_df["close"]) / 3.0
             pv = typical_price * mu_df["volume"]
@@ -539,9 +540,9 @@ class Strategy(_LumibotStrategy):
             cum_v = cum.groupby("day")["v"].cumsum()
             daily_vwap = cum_pv / cum_v.replace(0, np.nan)
 
-            indicators["mu_daily_vwap"] = daily_vwap.reindex(mu_df.index)
+            indicators[f"{sym}_daily_vwap"] = daily_vwap.reindex(mu_df.index)
         else:
-            indicators["mu_daily_vwap"] = None
+            indicators[f"{sym}_daily_vwap"] = None
 
         # SMH 原始數據與指標（SMH 缺失時進入降級模式，rs_ratio 設為 None）
         if smh_df is not None and not smh_df.empty:
@@ -549,8 +550,8 @@ class Strategy(_LumibotStrategy):
             indicators["smh_close"] = smh_close
             indicators["smh_vwap"] = compute_rolling_vwap(smh_close, period=VWAP_LOOKBACK)
 
-            # RS Ratio
-            indicators["rs_ratio"] = compute_rs_ratio(mu_close, smh_close)
+            # RS Ratio（個股 / SMH）
+            indicators["rs_ratio"] = compute_rs_ratio(close, smh_close)
             indicators["rs_ratio_ema"] = compute_rs_ratio_ema(indicators["rs_ratio"], period=RS_EMA_PERIOD)
         else:
             indicators["smh_close"] = None
@@ -563,42 +564,44 @@ class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
     # 訂單輔助方法
     # ------------------------------------------------------------------
-    def _sell_all(self, now, reason: str) -> None:
+    def _sell_all(self, symbol: str, now, reason: str) -> None:
         """
-        賣出全部 MU 持倉，並重置持倉狀態機（_has_position / _position_stage）。
+        賣出指定 symbol 的全部持倉，並重置持倉狀態機。
 
         優先使用 get_positions() 的實際數量；若拿不到（訂單結算延遲等），
-        以 self._position_quantity 追蹤值兜底，確保 15:55 強制清倉萬無一失。
+        以 self._pos[symbol]["qty"] 追蹤值兜底，確保 15:55 強制清倉萬無一失。
         """
-        # 嘗試從 positions 取得實際數量
-        qty = 0.0
-        positions = self.get_positions()
-        for p in positions:
-            if p.symbol == TRADE_SYMBOL and float(p.quantity) > 0:
-                qty = float(p.quantity)
-                break
+        pos = self._pos[symbol]
+        # 以追蹤值 pos["qty"] 為準（即時扣減，不受訂單結算延遲影響）；
+        # 避免 SELL 50% 後 get_positions() 尚未更新而重複賣出（賣超）。
+        qty = pos["qty"]
 
         if qty <= 0:
-            qty = self._position_quantity
+            # 追蹤值缺失時，從 get_positions 取得實際數量兜底
+            positions = self.get_positions()
+            for p in positions:
+                if p.symbol == symbol and float(p.quantity) > 0:
+                    qty = float(p.quantity)
+                    break
 
         if qty <= 0:
             # 無倉位可賣，僅重置狀態
-            self._has_position = False
-            self._position_stage = 0
+            pos["has"] = False
+            pos["stage"] = 0
             return
 
-        order = self.create_order(TRADE_SYMBOL, qty, "sell")
+        order = self.create_order(symbol, qty, "sell")
         self.submit_order(order)
-        self._has_position = False
-        self._position_quantity = 0.0
-        self._position_stage = 0  # 空倉
-        self.log_message(f"[SELL ALL] {now} | {reason} | qty={qty}")
+        pos["has"] = False
+        pos["qty"] = 0.0
+        pos["stage"] = 0  # 空倉
+        self.log_message(f"[SELL ALL] {now} | {symbol} | {reason} | qty={qty}")
 
-    def _sell_partial(self, quantity: int, now, reason: str) -> None:
-        """賣出部分 MU 持倉。"""
+    def _sell_partial(self, symbol: str, quantity: int, now, reason: str) -> None:
+        """賣出指定 symbol 的部分持倉。"""
         if quantity <= 0:
             return
-        order = self.create_order(TRADE_SYMBOL, quantity, "sell")
+        order = self.create_order(symbol, quantity, "sell")
         self.submit_order(order)
-        self._position_quantity = max(0.0, self._position_quantity - float(quantity))
-        self.log_message(f"[SELL 50%] {now} | {reason} | qty={quantity}")
+        self._pos[symbol]["qty"] = max(0.0, self._pos[symbol]["qty"] - float(quantity))
+        self.log_message(f"[SELL 50%] {now} | {symbol} | {reason} | qty={quantity}")

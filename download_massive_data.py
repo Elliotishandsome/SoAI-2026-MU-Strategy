@@ -33,8 +33,8 @@ from dotenv import load_dotenv
 # 可調參數
 # ============================================================================
 
-# 股票標的（v2.2 起已解綁 SPY：MU 主標的 + SMH 板塊）
-SYMBOLS = ["MU", "SMH"]
+# 股票標的（v2.7：交易標的 MU + AMD + 板塊 SMH）
+SYMBOLS = ["MU", "AMD", "SMH"]
 
 # 指數標的（VIX 為恐慌指數，用於 Layer 1 的恐慌過濾；需 Indices 方案權限）
 # 若方案無 Indices 權限（403），策略會自動跳過 VIX 過濾，不影響主流程。
