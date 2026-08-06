@@ -33,16 +33,16 @@ from dotenv import load_dotenv
 # 可調參數
 # ============================================================================
 
-# 股票標的（與 params.py 對應：MU 主標的 + SMH 板塊 + SPY 基準）
-SYMBOLS = ["MU", "SMH", "SPY"]
+# 股票標的（v2.2 起已解綁 SPY：MU 主標的 + SMH 板塊）
+SYMBOLS = ["MU", "SMH"]
 
 # 指數標的（VIX 為恐慌指數，用於 Layer 1 的恐慌過濾；需 Indices 方案權限）
 # 若方案無 Indices 權限（403），策略會自動跳過 VIX 過濾，不影響主流程。
 INDEX_SYMBOLS: list[str] = []
 
-# 數據範圍（對齊你提供的 MU 60 日數據：2026-05-11 → 2026-08-05）
-START_DATE = "2026-05-11"
-END_DATE = "2026-08-05"
+# 數據範圍（分段下載：免費方案有請求上限，一次拉太長會被 429 截斷）
+START_DATE = "2025-06-01"
+END_DATE = "2026-02-09"
 
 # 分鐘 bar 大小（策略會在內部重取樣為 RESAMPLE_MINUTES=5）
 INTERVAL_MIN = 1
@@ -56,7 +56,7 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 # API 設定
 API_BASE = "https://api.massive.com"
 API_KEY_ENV = "MASSIVE_API_KEY"
-REQUEST_DELAY = 0.35  # 秒，避免觸發 rate limit
+REQUEST_DELAY = 1.2  # 秒，避免觸發 rate limit（免費方案 429）
 
 
 # ============================================================================
@@ -109,6 +109,17 @@ def fetch_custom_bars(api_key: str, ticker: str, is_index: bool = False) -> list
             time.sleep(2)
             continue
 
+        if resp.status_code == 429:
+            # rate limit：等待 60 秒重試（最多 3 次）
+            for attempt in range(3):
+                print(f"[WARN] {ticker} rate limit (429)，等待 60 秒重試 ({attempt+1}/3)...")
+                time.sleep(60)
+                resp = requests.get(url, timeout=30)
+                if resp.status_code == 200:
+                    break
+            else:
+                print(f"[ERROR] {ticker} 持續 rate limit，放棄本頁")
+                break
         if resp.status_code == 401:
             print("[ERROR] API key 無效或無權限 (401)")
             print("  請確認 key 正確，且方案涵蓋所需數據")
