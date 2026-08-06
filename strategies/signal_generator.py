@@ -100,7 +100,7 @@ def check_vwap_break(
 
 
 # ============================================================================
-# Layer 3: 子系統 — 動能 + 量能確認
+# Layer 3: 子系統 — VWAP 回踩 + 動能 + 量能確認
 # ============================================================================
 
 def check_momentum_confirm(
@@ -108,7 +108,7 @@ def check_momentum_confirm(
     volume_surge: bool,
 ) -> tuple[bool, str]:
     """
-    子系統：RSI 動能確認 + 成交量放大。
+    子系統：RSI 動能確認 + 成交量放大（v2.2 相容版本）。
 
     Args:
         rsi: 當前 RSI(14)。
@@ -127,6 +127,69 @@ def check_momentum_confirm(
         return False, "成交量未放大"
 
     return True, f"RSI={rsi:.1f} 動能確認, 放量確認"
+
+
+def check_pullback_entry(
+    price: float,
+    vwap: float,
+    low: float,
+    prev_close: float,
+    rsi: float,
+    volume_surge: bool,
+    rsi_threshold: float = 52,
+    touch_tolerance: float = 0.002,
+) -> tuple[bool, str]:
+    """
+    子系統（v2.3）：VWAP 回踩不破進場。
+
+    取代「突破當下直接追高」的舊邏輯。僅在價格回踩 5m VWAP 後
+    重新站上時才進場，避免在假突破的高點追入。
+
+    形態條件（需同時滿足）：
+      1. 當前收盤價 > VWAP（站上均價線）
+      2. 回踩確認（任一）：
+         A. 當前 bar 最低價回踩至 VWAP 附近（low ≤ VWAP×(1+tolerance)）
+         B. 前一根收盤價 ≤ VWAP（本根才重新站上 = 回踩轉強）
+      3. RSI(14) > rsi_threshold（動能確認，預設 52）
+      4. 成交量放大（放量確認）
+
+    Args:
+        price: 當前收盤價。
+        vwap: 當前 5m VWAP。
+        low: 當前 bar 最低價。
+        prev_close: 前一根收盤價。
+        rsi: 當前 RSI(14)。
+        volume_surge: 是否放量。
+        rsi_threshold: RSI 門檻（預設 52）。
+        touch_tolerance: 回踩觸及的寬容比例（預設 0.2%）。
+
+    Returns:
+        (triggered: bool, reason: str)
+    """
+    if pd.isna(price) or pd.isna(vwap) or pd.isna(low):
+        return False, "價格/VWAP/最低價數據缺失"
+
+    # 1. 站上 VWAP
+    if price <= vwap:
+        return False, f"價格 {price:.2f} ≤ VWAP {vwap:.2f}"
+
+    # 2. 回踩確認
+    touch_level = vwap * (1 + touch_tolerance)
+    pulled_back_a = low <= touch_level          # 當根回踩至 VWAP 附近
+    pulled_back_b = (not pd.isna(prev_close)) and prev_close <= vwap  # 前根在 VWAP 下
+    if not (pulled_back_a or pulled_back_b):
+        return False, f"未回踩（low={low:.2f} > {touch_level:.2f}，直接突破追高）"
+
+    # 3. RSI 動能
+    if pd.isna(rsi) or rsi <= rsi_threshold:
+        return False, f"RSI {rsi:.1f} ≤ {rsi_threshold}"
+
+    # 4. 放量
+    if not volume_surge:
+        return False, "成交量未放大"
+
+    how = "當根回踩不破" if pulled_back_a else "前根回踩本根站上"
+    return True, f"VWAP回踩({how}): {price:.2f} > VWAP {vwap:.2f}, RSI={rsi:.1f}, 放量"
 
 
 # ============================================================================
@@ -282,16 +345,20 @@ def generate_signals(indicators: dict, idx: int) -> list[Signal]:
     if not vwap_ok:
         return [HOLD]
 
-    # --- Layer 3: 子系統 — 動能 + 量能確認 ---
+    # --- Layer 3: 子系統 — VWAP 回踩 + 動能 + 量能確認 ---
     rsi = _get("mu_rsi", np.nan)
     volume_surge = bool(_get("mu_volume_surge", False))
+    low = _get("mu_low", np.nan)
+    prev_close = _get("mu_close", np.nan)
+    if idx > 0 and isinstance(indicators.get("mu_close"), pd.Series) and idx < len(indicators["mu_close"]):
+        prev_close = indicators["mu_close"].iloc[idx - 1]
 
-    momentum_ok, momentum_reason = check_momentum_confirm(rsi, volume_surge)
-    if momentum_ok:
+    pullback_ok, pullback_reason = check_pullback_entry(price, vwap, low, prev_close, rsi, volume_surge)
+    if pullback_ok:
         signals.append(
             Signal(
                 "BUY",
-                f"三層全過: {rs_reason} | {vwap_reason} | {momentum_reason}",
+                f"三層全過: {rs_reason} | {vwap_reason} | {pullback_reason}",
                 confidence=0.85,
             )
         )

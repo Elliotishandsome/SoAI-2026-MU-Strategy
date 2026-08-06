@@ -76,7 +76,7 @@ SLIPPAGE_BPS = 1.0                # 滑點假設 (bps)
 
 # RSI
 RSI_PERIOD = 14
-RSI_OVERSOLD_THRESHOLD = 40       # 買入觸發：RSI 突破此值
+RSI_OVERSOLD_THRESHOLD = 52       # 買入觸發：RSI 突破此值（v2.3 由 40 提高，過濾高位追入）
 RSI_OVERBOUGHT_THRESHOLD = 70     # 止盈觸發：RSI 超過此值
 
 # 移動平均 / EMA
@@ -96,7 +96,14 @@ ATR_PERIOD = 14
 
 # 成交量
 VOLUME_MA_PERIOD = 10             # 成交量均線週期
-VOLUME_SURGE_MULTIPLIER = 1.5     # 放量倍數門檻
+VOLUME_SURGE_MULTIPLIER = 1.9     # 放量倍數門檻（v2.3 由 1.5 提高，過濾假突破）
+
+# VWAP 回踩進場（v2.3）
+# 形態條件：當前收盤站上 5m VWAP，且
+#   A. 當前 bar 最低價回踩至 VWAP 附近（low ≤ VWAP×1.002），或
+#   B. 前一根 bar 收盤在 VWAP 之下（本根才重新站上 = 回踩轉強）
+# 取代「突破當下直接追高」的舊邏輯
+PULLBACK_TOUCH_TOLERANCE = 0.002  # 回踩允許觸及的寬容比例 (0.2%)
 
 # ============================================================================
 # 4. 風控參數

@@ -79,7 +79,7 @@ from strategies.signal_generator import (
     HOLD,
     check_relative_strength,
     check_vwap_break,
-    check_momentum_confirm,
+    check_pullback_entry,
     check_exit_signals,
 )
 
@@ -448,18 +448,22 @@ class Strategy(_LumibotStrategy):
             return HOLD
 
         # ------------------------------------------------------------------
-        # Layer 3: 子系統 — 動能 + 量能確認
+        # Layer 3: 子系統 — VWAP 回踩 + 動能 + 量能確認
         # ------------------------------------------------------------------
         mu_rsi = indicators["mu_rsi"].iloc[idx]
+        mu_low = indicators["mu_low"].iloc[idx]
         volume_surge = bool(indicators["mu_volume_surge"].iloc[idx])
+        prev_close = indicators["mu_close"].iloc[idx - 1] if idx > 0 else mu_close
 
-        momentum_ok, momentum_reason = check_momentum_confirm(mu_rsi, volume_surge)
-        if not momentum_ok:
+        pullback_ok, pullback_reason = check_pullback_entry(
+            mu_close, mu_vwap, mu_low, prev_close, mu_rsi, volume_surge
+        )
+        if not pullback_ok:
             return HOLD
 
         return Signal(
             "BUY",
-            f"三層全過: {trend_reason} | {rs_reason} | {vwap_reason} | {momentum_reason}",
+            f"三層全過: {trend_reason} | {rs_reason} | {vwap_reason} | {pullback_reason}",
             confidence=0.85,
         )
 
