@@ -86,25 +86,40 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def compute_position_size(
-        self, capital: float, atr: float, price: float
+        self,
+        capital: float,
+        atr: float,
+        price: float,
+        leverage: float = 1.0,
+        cash_available: float | None = None,
     ) -> int:
         """
         根據「固定風險 + ATR 自適應」模型計算買入股數。
 
         公式: shares = floor[(capital × max_risk_ratio) / (atr_multiplier × ATR)]
 
+        v2.8：支援槓桿 —
+          - 以傳入的 capital（總組合價值）計算固定風險金額
+          - 單筆頭寸市值上限 = max_position_value × leverage
+          - 若提供 cash_available，最終以「現金 × leverage」為硬上限
+            （槓桿最多把可用現金放大 LEVERAGE 倍，避免透支）
+
         Args:
-            capital: 當前可用資金。
+            capital: 風險基準（建議傳總組合價值）。
             atr: 當前 ATR(14) 值。
             price: 當前價格。
+            leverage: 槓桿倍數（1.0 = 無槓桿）。
+            cash_available: 可動用現金（可選；用於槓桿硬上限）。
 
         Returns:
-            int: 建議買入股數（已考慮頭寸上限）。
+            int: 建議買入股數（已考慮所有上限）。
         """
         if atr <= 0 or price <= 0:
             return 0
 
-        risk_amount = capital * self.max_risk_ratio          # e.g. $20,000
+        lev = max(leverage, 1.0)
+        # 固定風險金額 × 槓桿（槓桿放大風險預算，倉位自然等比例放大）
+        risk_amount = capital * self.max_risk_ratio * lev
         stop_distance = self.atr_multiplier * atr             # e.g. 1.5 × ATR
         if stop_distance <= 0:
             return 0
@@ -112,9 +127,15 @@ class RiskManager:
         shares = risk_amount / stop_distance
         shares = math.floor(shares)
 
-        # 頭寸市值上限
-        max_shares_by_value = math.floor(self.max_position_value / price)
+        # 頭寸市值上限：初始資金 × 槓桿（2x = 最多 $2M，真實反映槓桿）
+        max_position_value = self.initial_capital * lev
+        max_shares_by_value = math.floor(max_position_value / price)
         shares = min(shares, max_shares_by_value)
+
+        # 現金硬上限：槓桿最多放大可用現金
+        if cash_available is not None and cash_available > 0:
+            max_shares_by_cash = math.floor((cash_available * lev) / price)
+            shares = min(shares, max_shares_by_cash)
 
         return max(0, shares)
 

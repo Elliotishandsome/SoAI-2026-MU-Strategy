@@ -49,6 +49,7 @@ from strategies.params import (
     MAX_RISK_RATIO,
     ATR_STOP_MULTIPLIER,
     MAX_POSITION_VALUE,
+    LEVERAGE,
     DAILY_LOSS_LIMIT,
     MAX_DAILY_TRADES,
     TAKE_PROFIT_RATIO,
@@ -146,7 +147,8 @@ class Strategy(_LumibotStrategy):
 
         self.log_message(
             f"[MultiSymbol Strategy] 初始化完成 | 模式={'intraday' if self.intraday_mode else 'daily'} | "
-            f"sleeptime={self.sleeptime} | 標的={TRADE_SYMBOLS} | 初始資金=${INITIAL_CAPITAL:,.0f}"
+            f"sleeptime={self.sleeptime} | 標的={TRADE_SYMBOLS} | 槓桿={LEVERAGE}x | "
+            f"初始資金=${INITIAL_CAPITAL:,.0f}"
         )
 
     # ------------------------------------------------------------------
@@ -300,13 +302,26 @@ class Strategy(_LumibotStrategy):
         if trade_signal.action != "BUY":
             return
 
-        # 計算倉位
+        # 計算倉位（v2.8 槓桿：以總組合價值為基準計算風險金額，
+        # 槓桿僅放寬單筆上限；可動用現金為最終約束）
         atr = indicators[f"{sym}_atr"].iloc[idx]
-        capital = self.get_cash()
-        shares = self.risk_mgr.compute_position_size(capital, atr, price)
+        equity = portfolio_value                      # 總組合價值（含持倉市值）
+        cash = self.get_cash()
+        shares = self.risk_mgr.compute_position_size(
+            equity, atr, price, leverage=LEVERAGE, cash_available=cash
+        )
 
         if shares <= 0:
             self.log_message(f"[{now}] {symbol} 倉位計算為 0，跳過")
+            return
+
+        # 市值上限檢查：不可超過可動用現金 × 槓桿
+        notional = shares * price
+        max_notional = cash * LEVERAGE
+        if notional > max_notional:
+            shares = int(max_notional / price)
+        if shares <= 0:
+            self.log_message(f"[{now}] {symbol} 現金不足（槓桿後），跳過")
             return
 
         # --- Step 5: 執行買入 ---
@@ -322,7 +337,7 @@ class Strategy(_LumibotStrategy):
         self.log_message(
             f"[BUY] {now} | {symbol} | {trade_signal.reason} | "
             f"shares={shares} @ ${price:.2f} | "
-            f"ATR={atr:.2f} | 資金=${capital:,.0f}"
+            f"ATR={atr:.2f} | equity=${equity:,.0f} | cash=${cash:,.0f} | 槓桿={LEVERAGE}x"
         )
 
         # --- Step 6: 日誌 ---
