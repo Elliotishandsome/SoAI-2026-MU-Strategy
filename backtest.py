@@ -45,14 +45,22 @@ from lumibot.entities import Asset, Data, TradingFee, TradingSlippage
 from strategies import params as P
 from strategies.strategy import Strategy
 from strategies.grid_strategy import GridStrategy
+from strategies.hybrid_strategy import HybridStrategy
 
 
 # ---------------------------------------------------------------------------
 # Strategy selection - which strategy class to backtest.
-#   STRATEGY=vwap  -> strategies.strategy.Strategy (VWAP 回踩波段, 預設)
-#   STRATEGY=grid  -> strategies.grid_strategy.GridStrategy (ADX 網格)
+#   STRATEGY=vwap   -> strategies.strategy.Strategy (VWAP 回踩波段, 預設)
+#   STRATEGY=grid   -> strategies.grid_strategy.GridStrategy (ADX 網格)
+#   STRATEGY=hybrid -> strategies.hybrid_strategy.HybridStrategy (ADX 混合)
 # ---------------------------------------------------------------------------
-STRATEGY_CLASS = GridStrategy if os.environ.get("STRATEGY", "vwap").lower() == "grid" else Strategy
+_STRATEGY_NAME = os.environ.get("STRATEGY", "vwap").lower()
+if _STRATEGY_NAME == "grid":
+    STRATEGY_CLASS = GridStrategy
+elif _STRATEGY_NAME == "hybrid":
+    STRATEGY_CLASS = HybridStrategy
+else:
+    STRATEGY_CLASS = Strategy
 
 
 # ---------------------------------------------------------------------------
