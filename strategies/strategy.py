@@ -41,8 +41,6 @@ from strategies.params import (
     SLEEPTIME,
     RESAMPLE_MINUTES,
     REQUIRE_SMH,
-    MTF_HIGHER_TIMEFRAME_MIN,
-    MTF_EMA_PERIOD,
     LAST_ENTRY_TIME_HOUR,
     LAST_ENTRY_TIME_MINUTE,
     BUY_COMMISSION_BPS,
@@ -411,16 +409,17 @@ class Strategy(_LumibotStrategy):
             Signal: 最終交易訊號。
         """
         # ------------------------------------------------------------------
-        # MTF: 大趨勢過濾（1H 收盤 > 1H EMA20 才允許做多）
-        # 5 分鐘的突破若無大級別趨勢支撐 = 一波流陷阱（7–8 月虧損主因）
+        # 大趨勢錨點：Daily VWAP（價格 > Daily VWAP = 今日多頭控盤）
+        # 5 分鐘的突破必須有「今天機構資金站在多方」的支撐才有效；
+        # 價格在 Daily VWAP 之下 = 主力出貨日，5 分鐘買點一律作廢。
         # ------------------------------------------------------------------
-        h1_close = indicators["mu_h1_close"].iloc[idx]
-        h1_ema = indicators["mu_h1_ema"].iloc[idx]
-        if pd.isna(h1_close) or pd.isna(h1_ema):
-            return HOLD  # 1H 數據不足，保守不進場
-        if h1_close <= h1_ema:
-            return HOLD  # 1H 空頭排列 → 5 分鐘所有買入訊號作廢
-        mtf_reason = f"1H趨勢向上: {h1_close:.2f} > EMA{MTF_EMA_PERIOD} {h1_ema:.2f}"
+        mu_close_here = indicators["mu_close"].iloc[idx]
+        daily_vwap = indicators["mu_daily_vwap"].iloc[idx]
+        if pd.isna(daily_vwap):
+            return HOLD  # Daily VWAP 數據不足，保守不進場
+        if mu_close_here <= daily_vwap:
+            return HOLD  # 價格在 Daily VWAP 之下 → 今日空頭控盤，買點作廢
+        trend_reason = f"DailyVWAP多頭: {mu_close_here:.2f} > 今日VWAP {daily_vwap:.2f}"
 
         # ------------------------------------------------------------------
         # Layer 1: 母系統 — 相對強弱（SMH 缺失 → MU 自我動能降級）
@@ -460,7 +459,7 @@ class Strategy(_LumibotStrategy):
 
         return Signal(
             "BUY",
-            f"三層全過: {mtf_reason} | {rs_reason} | {vwap_reason} | {momentum_reason}",
+            f"三層全過: {trend_reason} | {rs_reason} | {vwap_reason} | {momentum_reason}",
             confidence=0.85,
         )
 
@@ -503,22 +502,34 @@ class Strategy(_LumibotStrategy):
         indicators["mu_bb_lower"] = bb["bb_lower"]
         indicators["mu_bb_middle"] = bb["bb_middle"]
 
-        # ---- 多時間級別共振 (MTF)：1H 趨勢過濾 ----
-        # 將 5 分鐘 K 線重取樣為 1H K 線，計算 1H 20-EMA。
-        # 用 ffill 對齊回 5 分鐘索引（只使用已完成的 1H bar，避免未來函數）。
+        # ---- 大趨勢錨點：Daily VWAP（每日開盤重置） ----
+        # 反映「今天機構資金的總體態度」：價格 > Daily VWAP = 今日多頭控盤。
+        # 以美東交易日分組，從每天開盤第一根 bar 起累計 Σ(典型價×量)/Σ(量)。
+        # 只使用已完成 bar 的資訊，無未來函數。
         if self.intraday_mode:
-            h1 = (
-                mu_df.resample(f"{MTF_HIGHER_TIMEFRAME_MIN}min", label="right", closed="right")
-                .agg({"close": "last", "high": "max", "low": "min", "volume": "sum"})
-                .dropna(subset=["close"])
+            mu_idx = mu_df.index
+            if mu_idx.tz is None:
+                # CSV 模板為 UTC；無時區時先假設 UTC
+                local_idx = mu_idx.tz_localize("UTC").tz_convert(self._ny_tz)
+            else:
+                local_idx = mu_idx.tz_convert(self._ny_tz)
+
+            typical_price = (mu_df["high"] + mu_df["low"] + mu_df["close"]) / 3.0
+            pv = typical_price * mu_df["volume"]
+
+            cum = pd.DataFrame(
+                {"pv": pv.values, "v": mu_df["volume"].values},
+                index=mu_df.index,
             )
-            indicators["mu_h1_close"] = h1["close"].reindex(mu_df.index, method="ffill")
-            indicators["mu_h1_ema"] = (
-                h1["close"].ewm(span=MTF_EMA_PERIOD, adjust=False).mean().reindex(mu_df.index, method="ffill")
-            )
+            cum["day"] = local_idx.date  # 美東交易日
+
+            cum_pv = cum.groupby("day")["pv"].cumsum()
+            cum_v = cum.groupby("day")["v"].cumsum()
+            daily_vwap = cum_pv / cum_v.replace(0, np.nan)
+
+            indicators["mu_daily_vwap"] = daily_vwap.reindex(mu_df.index)
         else:
-            indicators["mu_h1_close"] = None
-            indicators["mu_h1_ema"] = None
+            indicators["mu_daily_vwap"] = None
 
         # SMH 原始數據與指標（SMH 缺失時進入降級模式，rs_ratio 設為 None）
         if smh_df is not None and not smh_df.empty:
