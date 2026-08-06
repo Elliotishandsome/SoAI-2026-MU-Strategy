@@ -35,6 +35,21 @@ SLEEPTIME = "5M"
 # 分鐘級回測時，將 1 分鐘 bar 重取樣為幾分鐘的 K 線（5 = 5 分鐘 K 線）
 RESAMPLE_MINUTES = 5
 
+# ============================================================================
+# 1.5 多時間級別共振 (MTF) — 大趨勢過濾
+# ============================================================================
+
+# 大級別 K 線：分鐘模式用 60 分鐘（1H）K 線
+MTF_HIGHER_TIMEFRAME_MIN = 60
+
+# 1H 趨勢過濾 EMA 週期：僅當 1H 收盤價 > 1H EMA20 才允許 5 分鐘買入
+MTF_EMA_PERIOD = 20
+
+# 最後允許開倉時間（美東）：Lumibot 在 15:55 後不再迭代，
+# 15:55 買入將無法當日清倉 → 15:50 後禁止開新倉
+LAST_ENTRY_TIME_HOUR = 15
+LAST_ENTRY_TIME_MINUTE = 50
+
 # CSV 數據模式（Pandas backtest）使用的標的清單
 # MU 主標的 + SMH 板塊 ETF（Layer1 RS 相對強弱需要）—— 已解綁 SPY
 STOCK_SLEEVE_SYMBOLS = [TRADE_SYMBOL, SECTOR_ETF]

@@ -41,6 +41,10 @@ from strategies.params import (
     SLEEPTIME,
     RESAMPLE_MINUTES,
     REQUIRE_SMH,
+    MTF_HIGHER_TIMEFRAME_MIN,
+    MTF_EMA_PERIOD,
+    LAST_ENTRY_TIME_HOUR,
+    LAST_ENTRY_TIME_MINUTE,
     BUY_COMMISSION_BPS,
     SELL_COMMISSION_BPS,
     MAX_RISK_RATIO,
@@ -123,6 +127,7 @@ class Strategy(_LumibotStrategy):
 
         # --- 策略狀態 ---
         self._has_position = False
+        self._position_quantity = 0.0  # 追蹤實際持倉股數（get_positions 兜底）
         self._entry_price = 0.0
         # 持倉階段狀態機: 0=空倉 / 1=全倉 / 2=底倉(已平50%)
         self._position_stage = 0
@@ -213,7 +218,10 @@ class Strategy(_LumibotStrategy):
         positions = self.get_positions()
         mu_position = next((p for p in positions if p.symbol == TRADE_SYMBOL), None)
 
-        if mu_position is not None and float(mu_position.quantity) > 0:
+        # 有倉位：以 get_positions 為主，self._has_position 兜底（訂單結算延遲時仍能出場）
+        has_position = (mu_position is not None and float(mu_position.quantity) > 0) or self._has_position
+
+        if has_position:
             exit_signals = check_exit_signals(
                 price=indicators["mu_close"].iloc[idx],
                 bb_upper=indicators["mu_bb_upper"].iloc[idx],
@@ -272,6 +280,13 @@ class Strategy(_LumibotStrategy):
             if self.risk_mgr.is_no_trade_window(now_ny.time()):
                 return
 
+            # 15:50 後禁止開新倉（Lumibot 15:55 後不再迭代，
+            # 此刻買入將無法當日強制清倉，導致隔夜持倉）
+            last_entry = time(LAST_ENTRY_TIME_HOUR, LAST_ENTRY_TIME_MINUTE)
+            if now_ny.time() >= last_entry:
+                self.log_message(f"[{now}] 已過最後開倉時間 {last_entry}，跳過")
+                return
+
         # 三層決策
         trade_signal = self._run_three_layer_decision(indicators, idx)
         if trade_signal.action != "BUY":
@@ -291,6 +306,7 @@ class Strategy(_LumibotStrategy):
         self.submit_order(order)
         self.risk_mgr.increment_trade_count()
         self._has_position = True
+        self._position_quantity += float(shares)
         self._position_stage = 1  # 全倉
         self._entry_price = mu_price
 
@@ -395,6 +411,18 @@ class Strategy(_LumibotStrategy):
             Signal: 最終交易訊號。
         """
         # ------------------------------------------------------------------
+        # MTF: 大趨勢過濾（1H 收盤 > 1H EMA20 才允許做多）
+        # 5 分鐘的突破若無大級別趨勢支撐 = 一波流陷阱（7–8 月虧損主因）
+        # ------------------------------------------------------------------
+        h1_close = indicators["mu_h1_close"].iloc[idx]
+        h1_ema = indicators["mu_h1_ema"].iloc[idx]
+        if pd.isna(h1_close) or pd.isna(h1_ema):
+            return HOLD  # 1H 數據不足，保守不進場
+        if h1_close <= h1_ema:
+            return HOLD  # 1H 空頭排列 → 5 分鐘所有買入訊號作廢
+        mtf_reason = f"1H趨勢向上: {h1_close:.2f} > EMA{MTF_EMA_PERIOD} {h1_ema:.2f}"
+
+        # ------------------------------------------------------------------
         # Layer 1: 母系統 — 相對強弱（SMH 缺失 → MU 自我動能降級）
         # ------------------------------------------------------------------
         if self._smh_available:
@@ -432,7 +460,7 @@ class Strategy(_LumibotStrategy):
 
         return Signal(
             "BUY",
-            f"三層全過: {rs_reason} | {vwap_reason} | {momentum_reason}",
+            f"三層全過: {mtf_reason} | {rs_reason} | {vwap_reason} | {momentum_reason}",
             confidence=0.85,
         )
 
@@ -475,6 +503,23 @@ class Strategy(_LumibotStrategy):
         indicators["mu_bb_lower"] = bb["bb_lower"]
         indicators["mu_bb_middle"] = bb["bb_middle"]
 
+        # ---- 多時間級別共振 (MTF)：1H 趨勢過濾 ----
+        # 將 5 分鐘 K 線重取樣為 1H K 線，計算 1H 20-EMA。
+        # 用 ffill 對齊回 5 分鐘索引（只使用已完成的 1H bar，避免未來函數）。
+        if self.intraday_mode:
+            h1 = (
+                mu_df.resample(f"{MTF_HIGHER_TIMEFRAME_MIN}min", label="right", closed="right")
+                .agg({"close": "last", "high": "max", "low": "min", "volume": "sum"})
+                .dropna(subset=["close"])
+            )
+            indicators["mu_h1_close"] = h1["close"].reindex(mu_df.index, method="ffill")
+            indicators["mu_h1_ema"] = (
+                h1["close"].ewm(span=MTF_EMA_PERIOD, adjust=False).mean().reindex(mu_df.index, method="ffill")
+            )
+        else:
+            indicators["mu_h1_close"] = None
+            indicators["mu_h1_ema"] = None
+
         # SMH 原始數據與指標（SMH 缺失時進入降級模式，rs_ratio 設為 None）
         if smh_df is not None and not smh_df.empty:
             smh_close = smh_df["close"]
@@ -496,16 +541,35 @@ class Strategy(_LumibotStrategy):
     # 訂單輔助方法
     # ------------------------------------------------------------------
     def _sell_all(self, now, reason: str) -> None:
-        """賣出全部 MU 持倉，並重置持倉狀態機（_has_position / _position_stage）。"""
+        """
+        賣出全部 MU 持倉，並重置持倉狀態機（_has_position / _position_stage）。
+
+        優先使用 get_positions() 的實際數量；若拿不到（訂單結算延遲等），
+        以 self._position_quantity 追蹤值兜底，確保 15:55 強制清倉萬無一失。
+        """
+        # 嘗試從 positions 取得實際數量
+        qty = 0.0
         positions = self.get_positions()
         for p in positions:
             if p.symbol == TRADE_SYMBOL and float(p.quantity) > 0:
-                order = self.create_order(TRADE_SYMBOL, float(p.quantity), "sell")
-                self.submit_order(order)
-                self._has_position = False
-                self._position_stage = 0  # 空倉
-                self.log_message(f"[SELL ALL] {now} | {reason} | qty={p.quantity}")
-                return
+                qty = float(p.quantity)
+                break
+
+        if qty <= 0:
+            qty = self._position_quantity
+
+        if qty <= 0:
+            # 無倉位可賣，僅重置狀態
+            self._has_position = False
+            self._position_stage = 0
+            return
+
+        order = self.create_order(TRADE_SYMBOL, qty, "sell")
+        self.submit_order(order)
+        self._has_position = False
+        self._position_quantity = 0.0
+        self._position_stage = 0  # 空倉
+        self.log_message(f"[SELL ALL] {now} | {reason} | qty={qty}")
 
     def _sell_partial(self, quantity: int, now, reason: str) -> None:
         """賣出部分 MU 持倉。"""
@@ -513,4 +577,5 @@ class Strategy(_LumibotStrategy):
             return
         order = self.create_order(TRADE_SYMBOL, quantity, "sell")
         self.submit_order(order)
+        self._position_quantity = max(0.0, self._position_quantity - float(quantity))
         self.log_message(f"[SELL 50%] {now} | {reason} | qty={quantity}")
