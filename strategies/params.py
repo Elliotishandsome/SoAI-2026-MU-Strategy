@@ -111,8 +111,8 @@ PULLBACK_TOUCH_TOLERANCE = 0.002  # 回踩允許觸及的寬容比例 (0.2%)
 
 MAX_RISK_RATIO = 0.02             # 單筆最大風險比例 (2%)
 ATR_STOP_MULTIPLIER = 1.5         # 止損 ATR 倍數
-MAX_POSITION_RATIO = 0.25         # 單筆頭寸上限 (25% of capital)
-MAX_POSITION_VALUE = 250_000      # 單筆建倉市值上限 (USD)
+MAX_POSITION_RATIO = 0.50         # 單筆頭寸上限 (50% of capital, v2.4 由 25% 提高)
+MAX_POSITION_VALUE = 500_000      # 單筆建倉市值上限 (USD, v2.4 由 250K 提高，提升資金使用率)
 DAILY_LOSS_LIMIT = 15_000         # 日內虧損熔斷 (USD)
 DAILY_LOSS_LIMIT_RATIO = 0.015    # 日內虧損熔斷比例 (1.5%)
 MAX_DAILY_TRADES = 20             # 單日交易次數上限

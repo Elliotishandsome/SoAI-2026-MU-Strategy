@@ -260,11 +260,17 @@ class Strategy(_LumibotStrategy):
                 self.log_message(f"[HALT] 日內虧損已達上限，停止交易")
                 return
 
-            return  # 已有持倉，不再開新倉
+            # v2.4：底倉階段（stage=2，已平 50%）允許再開新倉 — 一天可做多個波段。
+            # 全倉階段（stage=1）仍不開新倉，避免倉位無序疊加。
+            if self._position_stage != 2:
+                return  # 全倉階段，不再開新倉
+            # stage==2 → 繼續走入場邏輯（下方不 return）
 
         # --- Step 4: 檢查入場條件 ---
-        if mu_position is not None and float(mu_position.quantity) > 0:
-            return  # 已有持倉
+        # 全倉已於上方 return；底倉（stage=2）允許再開新倉。
+        # 僅擋非 stage=2 的殘留持倉狀態（理論上不會到達）。
+        if mu_position is not None and float(mu_position.quantity) > 0 and self._position_stage != 2:
+            return
 
         # 交易許可檢查
         daily_pnl = portfolio_value - self._day_start_value
@@ -305,6 +311,8 @@ class Strategy(_LumibotStrategy):
         self.risk_mgr.increment_trade_count()
         self._has_position = True
         self._position_quantity += float(shares)
+        # 底倉（stage=2）再加倉 → 回到全倉階段（stage=1），
+        # 讓新波段享有完整的止盈/止損管理（鎖利 50% 後再回 stage=2）
         self._position_stage = 1  # 全倉
         self._entry_price = mu_price
 
