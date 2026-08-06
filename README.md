@@ -1,98 +1,103 @@
-# MU AI 日內交易策略 — SoAI 2026
+# MU Intraday AI Trading Strategy — SoAI 2026
 
-> ## 🏁 最終參賽版本 v2.8（2026-08-07 定稿）
+> ## 🏁 FINAL SUBMISSION v2.8 (2026-08-07)
 >
-> **標的：MU（美光科技）｜槓桿：1.2x｜頻率：5 分鐘 K 線｜純日內（15:55 強制清倉）**
+> **Symbol: MU (Micron Technology) | Leverage: 1.2x | Cadence: 5-min bars | Pure intraday (forced flat at 15:55 ET)**
 >
-> **14 個月回測（2025-06 → 2026-08）：+$146,011（14.6%）｜Sharpe 1.41｜
-> Sortino 4.52｜勝率 69.4%｜盈虧比 2.82｜最大回撤 -1.7%｜0 隔夜持倉**
+> **14-month backtest (Jun 2025 → Aug 2026): +$146,011 (14.6%) | Sharpe 1.41 |
+> Sortino 4.52 | Win rate 69.4% | Profit factor 2.82 | Max drawdown -1.7% | 0 overnight positions**
 
-## 策略概述
+## Strategy Overview
 
-本策略專為 **美光科技 (MU)** 設計，採用 **三層決策架構**，透過純價格行為
-（Price Action）與指數情緒共振進行日內交易，規避新聞與基本面噪音。
+This strategy is purpose-built for **Micron Technology (MU)** using a
+**three-layer decision framework** that trades purely on price action and
+sector sentiment — avoiding news and fundamental noise.
 
-| 項目 | 值 |
-|------|-----|
-| 交易標的 | MU (Micron Technology) |
-| 運行週期 | 5 分鐘 K 線 |
-| 初始資金 | $1,000,000 USD |
-| 手續費 | 雙邊各 2 bps (0.02%) |
-| 持倉時間 | 純日內，美東 15:55 強制清倉 |
-| 槓桿 | 1.2x（總曝險 = equity × 1.2 − 既有持倉市值）|
+| Item | Value |
+|------|-------|
+| Traded symbol | MU (Micron Technology) |
+| Bar cadence | 5-minute OHLCV |
+| Initial capital | $1,000,000 USD |
+| Fees | 2 bps (0.02%) per side |
+| Holding period | Intraday only; forced liquidation 15:55 ET |
+| Leverage | 1.2x (total exposure = equity × 1.2 − existing position value) |
 
-## 三層決策架構
+## Three-Layer Decision Framework
 
-### 大趨勢錨點：Daily VWAP
-- Daily VWAP 每日開盤重置，從當日第一根 bar 起累計 Σ(典型價×量)/Σ(量)
-- **僅當 MU 價格 > Daily VWAP（今日多頭控盤）時，5 分鐘買點才有效**
-- 價格 < Daily VWAP = 今日主力出貨 → 5 分鐘買點一律作廢
+### Macro Trend Anchor: Daily VWAP
+- Daily VWAP resets every open and accumulates Σ(typical price × volume)/Σ(volume)
+  from the first bar of the session.
+- **A 5-minute buy is only valid when MU price > Daily VWAP** (bulls in control today).
+- Price below Daily VWAP = institutional distribution day → all 5-minute entries void.
 
-### 第 1 層：母系統 — 個股相對強弱 (RS Ratio)
+### Layer 1: Master System — Relative Strength (RS Ratio)
 - `RS_Ratio = MU Price / SMH Price`
-- **RS_Ratio > 10 週期 EMA → MU 比半導體板塊強，允許做多**
-- SMH 數據缺失時降級為「MU 自身價格 > 自身 VWAP」
+- **RS_Ratio above its 10-period EMA → MU is stronger than the semiconductor
+  sector, longs allowed.**
+- If SMH data is unavailable, falls back to "MU price above its own VWAP".
 
-### 第 2 層：核心系統 — 價格突破 VWAP
-- MU 價格必須位於 5 分鐘 VWAP 之上
+### Layer 2: Core System — Price Above VWAP
+- MU price must be above the 5-minute VWAP (upward breakout).
 
-### 第 3 層：子系統 — VWAP 回踩進場
-- 僅在價格回踩 5m VWAP 後重新站上時進場（當根 low 觸及 VWAP 附近 ≤×1.002，
-  或前一根收盤在 VWAP 之下）
-- **RSI(14) > 52**（過濾高位追入）
-- **放量倍數 ≥ 1.9×**（過濾假突破）
-- 止盈：布林帶上軌 / RSI > 70 → 平倉 50%；跌破 20-EMA → 全數清倉
+### Layer 3: Sub-System — VWAP Pullback Entry
+- Enter only after price pulls back toward the 5-min VWAP and reclaims it
+  (current-bar low touches within ≤×1.002 of VWAP, or prior bar closed below VWAP).
+- **RSI(14) > 52** (filter out late-chasing entries).
+- **Volume surge ≥ 1.9× its moving average** (filter out false breakouts).
+- Exits: Bollinger upper band / RSI > 70 → sell 50%; close below 20-EMA → sell all.
 
-## 風控約束
+## Risk Controls
 
-| 約束 | 值 |
-|------|-----|
-| 倉位模型 | 固定風險（equity × 2%）+ ATR 自適應 |
-| 止損距離 | 1.5 × ATR |
-| 單筆頭寸上限 | 初始資金 × 槓桿（$1.2M）|
-| 日內熔斷 | 虧損 $15,000（1.5%）→ 立即停機 |
-| 交易頻率限制 | 單日最多 20 筆 |
-| 開盤保護 | 9:30–10:00 僅監控不下單 |
-| 強制清倉 | 15:50 後禁開新倉；15:55 全部清倉 |
+| Constraint | Value |
+|------------|-------|
+| Position model | Fixed-risk (equity × 2%) + ATR-adaptive |
+| Stop distance | 1.5 × ATR |
+| Single position cap | initial capital × leverage ($1.2M) |
+| Intraday circuit breaker | -$15,000 (1.5%) → halt for the day |
+| Daily trade limit | 20 trades max |
+| Opening protection | 9:30–10:00 ET monitor only, no orders |
+| Forced liquidation | no new entries after 15:50; full liquidation 15:55 ET |
 
-## 回測結果（14 個月，2025-06 → 2026-08）
+## Backtest Results (14 months, Jun 2025 → Aug 2026)
 
-| 指標 | 數值 |
-|------|------|
-| 日內淨損益 | **+$146,011（14.6%）** |
+| Metric | Value |
+|--------|-------|
+| Intraday net P&L | **+$146,011 (14.6%)** |
 | Sharpe | 1.41 |
 | Sortino | 4.52 |
-| 勝率 | 69.4% |
-| 盈虧比 | 2.82 |
-| 最大回撤 | -1.7% |
-| 隔夜持倉 | 0 |
+| Win rate | 69.4% |
+| Profit factor | 2.82 |
+| Max drawdown | -1.7% |
+| Overnight positions | 0 |
 
-近三個月驗證（2026-05-05 → 08-05）：**+$50,912**，Sharpe 1.81，勝率 75%，
-盈虧比 5.07，0 隔夜 — 與長歷史結果一致，無過擬合疑慮。
+Recent 3-month validation (2026-05-05 → 08-05): **+$50,912**, Sharpe 1.81,
+win rate 75%, profit factor 5.07, 0 overnight — consistent with the long
+history, no overfitting concerns.
 
-## 模組結構
+## Module Structure
 
 ```text
 strategies/
-├── __init__.py            # 套件初始化
-├── params.py              # 所有可調參數集中管理
-├── indicators.py          # 技術指標純函數（RSI/ATR/VWAP/BB/EMA/RS_Ratio）
-├── risk_manager.py        # 風控管理（倉位計算/熔斷/時間約束）
-├── signal_generator.py    # 三層訊號生成（純函數）
-└── strategy.py            # 主策略類（Lumibot 入口，官方執行此檔）
+├── __init__.py            # package init
+├── params.py              # all tunable parameters in one place
+├── indicators.py          # pure indicator functions (RSI/ATR/VWAP/BB/EMA/RS_Ratio)
+├── risk_manager.py        # risk management (position sizing / circuit breaker / time windows)
+├── signal_generator.py    # three-layer signal generation (pure functions)
+└── strategy.py            # main strategy class (Lumibot entrypoint, official execution)
 ```
 
-## 快速回測
+## Quick Backtest
 
 ```bash
 pip install -r requirements.txt
-# 準備 data/MU_1m_spot.csv 與 data/SMH_1m_spot.csv（1 分鐘 OHLCV，UTC 時區）
-python backtest.py   # 5 分鐘 K 線回測
+# Provide data/MU_1m_spot.csv and data/SMH_1m_spot.csv (1-min OHLCV, UTC)
+python backtest.py   # 5-min bar backtest
 ```
 
-官方評分僅由 IntelligenceX 技術團隊在標準化環境中執行
-`strategies/strategy.py` 產生，本地回測僅供開發驗證。
+The official score is generated **only** by the IntelligenceX technical team
+running `strategies/strategy.py` in a standardized environment; the local
+backtest is for development validation only.
 
 ---
 
-*基於 [SoAI 2026 AI Algorithmic Trading Competition](https://www.soc-ai.org/events/intelligencex-2026) 官方模板構建。*
+*Built on the [SoAI 2026 AI Algorithmic Trading Competition](https://www.soc-ai.org/events/intelligencex-2026) official template.*
