@@ -75,9 +75,9 @@ from strategies.risk_manager import RiskManager
 from strategies.signal_generator import (
     Signal,
     HOLD,
-    check_market_sentiment,
     check_relative_strength,
-    check_entry_signal,
+    check_vwap_break,
+    check_momentum_confirm,
     check_exit_signals,
 )
 
@@ -376,11 +376,16 @@ class Strategy(_LumibotStrategy):
     # ------------------------------------------------------------------
     def _run_three_layer_decision(self, indicators: dict, idx: int) -> Signal:
         """
-        執行三層決策流程。
+        執行三層決策流程（v2 — 相對強弱制）。
+
+        三層架構：
+          Layer 1 母系統 — RS 相對強弱（RS = MU/SMH > RS_EMA）
+          Layer 2 核心系統 — 價格突破 VWAP
+          Layer 3 子系統 — RSI 動能 + 放量確認
 
         SMH 數據缺失時進入降級模式：
-          - Layer 1 改用 MU 自身價格 vs MU VWAP（自我板塊情緒檢查）
-          - Layer 2 跳過（RS_Ratio 無法計算，視為通過）
+          - Layer 1 改用 MU 自身動能（MU 價格 > MU 自身 VWAP）
+          - RS_Ratio 無法計算時視為通過
 
         Args:
             indicators: 指標 dict。
@@ -390,53 +395,44 @@ class Strategy(_LumibotStrategy):
             Signal: 最終交易訊號。
         """
         # ------------------------------------------------------------------
-        # Layer 1: 母系統 — 板塊情緒（SMH 缺失 → MU 自我檢查降級）
-        # ------------------------------------------------------------------
-        vix_spike = False  # 日線/分鐘模式暫不檢查 VIX
-
-        if not self._smh_available:
-            mu_close_l1 = indicators["mu_close"].iloc[idx]
-            mu_vwap_l1 = indicators["mu_vwap"].iloc[idx]
-            sentiment_ok, sentiment_reason = check_market_sentiment(mu_close_l1, mu_vwap_l1, vix_spike)
-            sentiment_reason += " [SMH 缺失，降級為 MU 自我檢查]"
-        else:
-            smh_close = indicators["smh_close"].iloc[idx]
-            smh_vwap = indicators["smh_vwap"].iloc[idx]
-            sentiment_ok, sentiment_reason = check_market_sentiment(smh_close, smh_vwap, vix_spike)
-
-        if not sentiment_ok:
-            return HOLD
-
-        # ------------------------------------------------------------------
-        # Layer 2: 核心系統 — 相對強弱（SMH 缺失 → 跳過）
+        # Layer 1: 母系統 — 相對強弱（SMH 缺失 → MU 自我動能降級）
         # ------------------------------------------------------------------
         if self._smh_available:
             rs_ratio = indicators["rs_ratio"].iloc[idx]
             rs_ratio_ema = indicators["rs_ratio_ema"].iloc[idx]
             rs_ok, rs_reason = check_relative_strength(rs_ratio, rs_ratio_ema)
-            if not rs_ok:
-                return HOLD
         else:
-            rs_reason = "RS_Ratio 不可計算 [SMH 缺失，跳過]"
+            # 降級：以 MU 自身價格 vs VWAP 作為替代動能檢查
+            mu_close_l1 = indicators["mu_close"].iloc[idx]
+            mu_vwap_l1 = indicators["mu_vwap"].iloc[idx]
+            rs_ok, rs_reason = check_vwap_break(mu_close_l1, mu_vwap_l1)
+            rs_reason += " [SMH 缺失，降級為 MU 自我動能]"
+
+        if not rs_ok:
+            return HOLD
 
         # ------------------------------------------------------------------
-        # Layer 3: 子系統 — 微觀執行
+        # Layer 2: 核心系統 — 價格突破 VWAP
         # ------------------------------------------------------------------
         mu_close = indicators["mu_close"].iloc[idx]
         mu_vwap = indicators["mu_vwap"].iloc[idx]
+        vwap_ok, vwap_reason = check_vwap_break(mu_close, mu_vwap)
+        if not vwap_ok:
+            return HOLD
+
+        # ------------------------------------------------------------------
+        # Layer 3: 子系統 — 動能 + 量能確認
+        # ------------------------------------------------------------------
         mu_rsi = indicators["mu_rsi"].iloc[idx]
-        mu_rsi_prev = indicators["mu_rsi_prev"].iloc[idx]
         volume_surge = bool(indicators["mu_volume_surge"].iloc[idx])
 
-        entry_ok, entry_reason = check_entry_signal(
-            mu_close, mu_vwap, mu_rsi, mu_rsi_prev, volume_surge
-        )
-        if not entry_ok:
+        momentum_ok, momentum_reason = check_momentum_confirm(mu_rsi, volume_surge)
+        if not momentum_ok:
             return HOLD
 
         return Signal(
             "BUY",
-            f"三層全過: {sentiment_reason} | {rs_reason} | {entry_reason}",
+            f"三層全過: {rs_reason} | {vwap_reason} | {momentum_reason}",
             confidence=0.85,
         )
 

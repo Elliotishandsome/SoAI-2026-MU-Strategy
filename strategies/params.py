@@ -19,12 +19,12 @@
 # 主交易標的
 TRADE_SYMBOL = "MU"
 
-# 輔助標的（用於情緒過濾）
-SECTOR_ETF = "SMH"       # 半導體板塊 ETF
-VOLATILITY_INDEX = "^VIX"  # 恐慌指數（Yahoo 代碼為 ^VIX；VIX 選項也可）
+# 輔助標的（用於相對強弱 RS = MU/SMH）
+SECTOR_ETF = "SMH"       # 半導體板塊 ETF（替代 SPY 作為板塊參照）
+VOLATILITY_INDEX = "^VIX"  # 恐慌指數（Yahoo 代碼為 ^VIX；v2 暫不強制使用）
 
-# 回測對標基準
-BENCHMARK = "SPY"
+# 回測對標基準 — 解綁 SPY，改用半導體板塊指數 SMH
+BENCHMARK = "SMH"
 
 # 策略喚醒頻率（Lumibot sleeptime）：
 #   "5M" = 5 分鐘級（分鐘回測，配合 data/ 下的 1m CSV 使用）
@@ -36,15 +36,15 @@ SLEEPTIME = "5M"
 RESAMPLE_MINUTES = 5
 
 # CSV 數據模式（Pandas backtest）使用的標的清單
-# MU 主標的 + SMH 板塊 ETF（Layer1/Layer2 需要）+ SPY 基準
-STOCK_SLEEVE_SYMBOLS = [TRADE_SYMBOL, SECTOR_ETF, BENCHMARK]
+# MU 主標的 + SMH 板塊 ETF（Layer1 RS 相對強弱需要）—— 已解綁 SPY
+STOCK_SLEEVE_SYMBOLS = [TRADE_SYMBOL, SECTOR_ETF]
 CRYPTO_SLEEVE_SYMBOLS: list[str] = []
 STOCK_BENCH = BENCHMARK
 CRYPTO_BENCH = BENCHMARK
 CRYPTO_SYMBOLS: set[str] = set(CRYPTO_SLEEVE_SYMBOLS)
 
-# 是否強制要求 SMH 數據（True = SMH 缺失時停止交易；False = 降級為只用 MU 自身指標）
-# 目前 data/ 有完整 SMH 數據，保持 True 使用完整三層架構
+# 是否強制要求 SMH 數據（True = SMH 缺失時停止交易；False = 降級為只用 MU 自身動能）
+# 目前 data/ 有完整 SMH 數據，保持 True 使用完整 RS 相對強弱架構
 REQUIRE_SMH = True
 
 # ============================================================================
