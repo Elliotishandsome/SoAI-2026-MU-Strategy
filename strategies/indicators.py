@@ -207,6 +207,67 @@ def compute_volume_ma(volume: pd.Series, period: int = 10) -> pd.Series:
 
 
 # ============================================================================
+# ADX — Average Directional Index（趨勢強度）
+# ============================================================================
+
+def compute_adx(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
+    """
+    計算 ADX（Wilder's 平滑）。
+
+    ADX 不分漲跌，只衡量趨勢強度：
+      - ADX < 25 → 無明顯趨勢（震盪市，適合網格）
+      - ADX ≥ 25 → 單邊趨勢形成（無論多空，網格應暫停）
+
+    實作（Wilder）：
+      1. +DM / -DM（方向運動）
+      2. TR（真實波幅）
+      3. Wilder 平滑 → +DI / -DI
+      4. DX = |+DI - -DI| / (+DI + -DI) × 100
+      5. ADX = DX 的 Wilder 平滑
+
+    Args:
+        high: 最高價序列。
+        low: 最低價序列。
+        close: 收盤價序列。
+        period: ADX 週期，預設 14。
+
+    Returns:
+        pd.Series: ADX 值 (0–100)，前 ~2×period 個值為 NaN。
+    """
+    # --- True Range ---
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    # --- Directional Movement ---
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=high.index)
+
+    # --- Wilder 平滑（alpha = 1/period） ---
+    tr_smooth = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_dm_smooth = plus_dm.ewm(alpha=1 / period, adjust=False).mean()
+    minus_dm_smooth = minus_dm.ewm(alpha=1 / period, adjust=False).mean()
+
+    # --- +DI / -DI ---
+    plus_di = 100.0 * plus_dm_smooth / tr_smooth.replace(0, np.nan)
+    minus_di = 100.0 * minus_dm_smooth / tr_smooth.replace(0, np.nan)
+
+    # --- DX → ADX ---
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+
+    return adx
+
+
+# ============================================================================
 # VXN/VIX ATR 波動率檢測
 # ============================================================================
 

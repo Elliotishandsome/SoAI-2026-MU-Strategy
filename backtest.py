@@ -36,6 +36,7 @@ Useful Lumibot documentation
 
 from pathlib import Path
 from datetime import datetime, timezone
+import os
 
 import pandas as pd
 from lumibot.backtesting import PandasDataBacktesting
@@ -43,6 +44,15 @@ from lumibot.entities import Asset, Data, TradingFee, TradingSlippage
 
 from strategies import params as P
 from strategies.strategy import Strategy
+from strategies.grid_strategy import GridStrategy
+
+
+# ---------------------------------------------------------------------------
+# Strategy selection - which strategy class to backtest.
+#   STRATEGY=vwap  -> strategies.strategy.Strategy (VWAP 回踩波段, 預設)
+#   STRATEGY=grid  -> strategies.grid_strategy.GridStrategy (ADX 網格)
+# ---------------------------------------------------------------------------
+STRATEGY_CLASS = GridStrategy if os.environ.get("STRATEGY", "vwap").lower() == "grid" else Strategy
 
 
 # ---------------------------------------------------------------------------
@@ -233,10 +243,11 @@ def run_backtest() -> None:
 
     print(
         f"[INFO] Loaded {len(pandas_data)} assets from {DATA_DIR}\n"
-        f"[INFO] Backtest window: {backtesting_start} -> {backtesting_end}"
+        f"[INFO] Backtest window: {backtesting_start} -> {backtesting_end}\n"
+        f"[INFO] Strategy: {STRATEGY_CLASS.__name__}"
     )
 
-    Strategy.run_backtest(
+    STRATEGY_CLASS.run_backtest(
         PandasDataBacktesting,
         backtesting_start,
         backtesting_end,
