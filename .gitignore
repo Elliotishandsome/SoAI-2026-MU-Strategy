@@ -11,3 +11,10 @@ __pycache__/
 data/raw/
 data/*.parquet
 data/cache/
+# 本地歷史數據（大檔案，官方環境不需要；EXAMPLE 範例保留）
+data/AMD_1m_spot.csv
+data/MU_1m_spot.csv
+data/SMH_1m_spot.csv
+data/SNDK_1m_spot.csv
+data/SPY_1m_spot.csv
+data/STX_1m_spot.csv
