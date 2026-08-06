@@ -18,7 +18,7 @@
 
 # 主交易標的（v2.7：支援多標的）
 TRADE_SYMBOL = "MU"                   # 主要標的（日誌/兼容用）
-TRADE_SYMBOLS = ["MU"]                # 可交易標的（v2.8：純 MU；SPY 測試見 README）
+TRADE_SYMBOLS = ["MU"]                # 可交易標的（v2.8：純 MU；SNDK/SPY 測試見 README）
 
 # 輔助標的（用於相對強弱 RS = 個股/SMH）
 SECTOR_ETF = "SMH"       # 半導體板塊 ETF（替代 SPY 作為板塊參照）
