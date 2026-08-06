@@ -132,11 +132,6 @@ class RiskManager:
         max_shares_by_value = math.floor(max_position_value / price)
         shares = min(shares, max_shares_by_value)
 
-        # 現金硬上限：槓桿最多放大可用現金
-        if cash_available is not None and cash_available > 0:
-            max_shares_by_cash = math.floor((cash_available * lev) / price)
-            shares = min(shares, max_shares_by_cash)
-
         return max(0, shares)
 
     # ------------------------------------------------------------------

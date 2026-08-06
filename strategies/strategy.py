@@ -144,6 +144,7 @@ class Strategy(_LumibotStrategy):
 
         # --- 記錄每日起始組合淨值（用於計算當日盈虧） ---
         self._day_start_value = self.get_portfolio_value()
+        self._last_date: object = None  # 用於每日重置 _day_start_value
 
         self.log_message(
             f"[MultiSymbol Strategy] 初始化完成 | 模式={'intraday' if self.intraday_mode else 'daily'} | "
@@ -170,6 +171,10 @@ class Strategy(_LumibotStrategy):
 
         # --- 每日重置檢查 ---
         self.risk_mgr.check_new_day(now)
+        if self._last_date is None or now.date() != self._last_date:
+            self._day_start_value = portfolio_value  # 每日基準（當日盈虧）
+        self._last_date = now.date()
+
         if self.risk_mgr.is_halted():
             return  # 熔斷中，不做任何操作
 
@@ -302,8 +307,8 @@ class Strategy(_LumibotStrategy):
         if trade_signal.action != "BUY":
             return
 
-        # 計算倉位（v2.8 槓桿：以總組合價值為基準計算風險金額，
-        # 槓桿僅放寬單筆上限；可動用現金為最終約束）
+        # 計算倉位（v2.8 槓桿：以總組合價值為基準計算風險金額；
+        # 購買力 = equity × 槓桿 − 既有持倉市值，槓桿體現在總曝險而非單筆）
         atr = indicators[f"{sym}_atr"].iloc[idx]
         equity = portfolio_value                      # 總組合價值（含持倉市值）
         cash = self.get_cash()
@@ -315,13 +320,13 @@ class Strategy(_LumibotStrategy):
             self.log_message(f"[{now}] {symbol} 倉位計算為 0，跳過")
             return
 
-        # 市值上限檢查：不可超過可動用現金 × 槓桿
-        notional = shares * price
-        max_notional = cash * LEVERAGE
-        if notional > max_notional:
-            shares = int(max_notional / price)
+        # 購買力上限：總曝險（既有持倉 + 新買）≤ equity × LEVERAGE
+        existing_value = pos["qty"] * price           # 既有持倉市值（追蹤值）
+        buying_power = equity * LEVERAGE - existing_value
+        if shares * price > buying_power:
+            shares = int(buying_power / price)
         if shares <= 0:
-            self.log_message(f"[{now}] {symbol} 現金不足（槓桿後），跳過")
+            self.log_message(f"[{now}] {symbol} 購買力不足（槓桿後），跳過")
             return
 
         # --- Step 5: 執行買入 ---
