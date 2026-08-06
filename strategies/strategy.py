@@ -168,15 +168,16 @@ class Strategy(_LumibotStrategy):
         mu_price = self.get_last_price(TRADE_SYMBOL)
         smh_price = self.get_last_price(SECTOR_ETF)
 
-        if mu_price is None or smh_price is None:
-            if mu_price is None:
-                self.log_message(f"[{now}] MU 價格缺失，跳過本週期")
-                return
-            # SMH 缺失 → 降級模式（僅當 REQUIRE_SMH=False 時繼續）
-            self._smh_available = False
-            if REQUIRE_SMH:
-                self.log_message(f"[{now}] SMH 數據缺失且 REQUIRE_SMH=True，停止交易")
-                return
+        # SMH 可用性（缺失時進入降級模式）
+        self._smh_available = smh_price is not None
+
+        if mu_price is None:
+            self.log_message(f"[{now}] MU 價格缺失，跳過本週期")
+            return
+
+        if not self._smh_available and REQUIRE_SMH:
+            self.log_message(f"[{now}] SMH 數據缺失且 REQUIRE_SMH=True，停止交易")
+            return
 
         # --- Step 2: 取歷史數據並計算指標 ---
         lookback = self._get_lookback()

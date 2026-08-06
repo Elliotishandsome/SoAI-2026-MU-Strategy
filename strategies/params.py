@@ -35,17 +35,17 @@ SLEEPTIME = "5M"
 # 分鐘級回測時，將 1 分鐘 bar 重取樣為幾分鐘的 K 線（5 = 5 分鐘 K 線）
 RESAMPLE_MINUTES = 5
 
-# CSV 數據模式（Pandas backtest）使用的標的清單（保留相容性）
-# 注意：目前 data/ 只有 MU 的 1 分鐘 CSV（來自 .numbers 轉換）。
-#       SMH/SPY 無數據時策略會自動進入「降級模式」（見 strategy.py）。
-STOCK_SLEEVE_SYMBOLS = [TRADE_SYMBOL]
+# CSV 數據模式（Pandas backtest）使用的標的清單
+# MU 主標的 + SMH 板塊 ETF（Layer1/Layer2 需要）+ SPY 基準
+STOCK_SLEEVE_SYMBOLS = [TRADE_SYMBOL, SECTOR_ETF, BENCHMARK]
 CRYPTO_SLEEVE_SYMBOLS: list[str] = []
-STOCK_BENCH = TRADE_SYMBOL
-CRYPTO_BENCH = TRADE_SYMBOL
+STOCK_BENCH = BENCHMARK
+CRYPTO_BENCH = BENCHMARK
 CRYPTO_SYMBOLS: set[str] = set(CRYPTO_SLEEVE_SYMBOLS)
 
 # 是否強制要求 SMH 數據（True = SMH 缺失時停止交易；False = 降級為只用 MU 自身指標）
-REQUIRE_SMH = False
+# 目前 data/ 有完整 SMH 數據，保持 True 使用完整三層架構
+REQUIRE_SMH = True
 
 # ============================================================================
 # 2. 資金 & 費率
